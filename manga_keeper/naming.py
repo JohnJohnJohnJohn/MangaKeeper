@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Optional, Union
@@ -303,4 +304,9 @@ def folder_name_is_standard(path: PathLike) -> bool:
     target = Path(path)
     if not target.is_dir():
         return True
-    return target.name == standard_folder_name(target)
+    standard = standard_folder_name(target)
+    if target.name == standard:
+        return True
+    if os.name == "nt" and target.name.casefold() == standard.casefold():
+        return True
+    return False

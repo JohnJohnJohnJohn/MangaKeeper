@@ -263,13 +263,42 @@ def _unique_path(directory: Path, filename: str) -> Path:
         counter += 1
 
 
-def _unique_output_dir(parent: Path, folder_name: str) -> Path:
+def _paths_refer_to_same_entry(left: Path, right: Path) -> bool:
+    try:
+        return left.resolve() == right.resolve()
+    except OSError:
+        return False
+
+
+def _unique_output_dir(
+    parent: Path,
+    folder_name: str,
+    *,
+    exclude: Optional[Path] = None,
+) -> Path:
     output = parent / folder_name
     counter = 2
-    while output.exists():
+    while output.exists() and not (
+        exclude is not None and _paths_refer_to_same_entry(output, exclude)
+    ):
         output = parent / f"{folder_name}__{counter}"
         counter += 1
     return output
+
+
+def _rename_path(source: Path, destination: Path) -> None:
+    if source.name == destination.name:
+        return
+    if _paths_refer_to_same_entry(source, destination):
+        temp = source.with_name(f".{source.name}.manga_keeper_rename.tmp")
+        suffix = 0
+        while temp.exists():
+            suffix += 1
+            temp = source.with_name(f".{source.name}.manga_keeper_rename.{suffix}.tmp")
+        source.rename(temp)
+        temp.rename(destination)
+        return
+    source.rename(destination)
 
 
 def _conversion_destination(image: Path, settings: ConversionSettings) -> Path:
@@ -410,9 +439,9 @@ def _rename_folder_to_standard(folder: Path) -> Path:
     if folder.name == target_name:
         return folder
 
-    destination = _unique_output_dir(folder.parent, target_name)
+    destination = _unique_output_dir(folder.parent, target_name, exclude=folder)
     try:
-        folder.rename(destination)
+        _rename_path(folder, destination)
     except OSError as exc:
         log.error("Failed renaming folder %s -> %s: %s", folder, destination, exc)
         return folder
