@@ -38,8 +38,13 @@ _BRACKET_CLOSE_RE = re.compile(
     rf"([{re.escape(_BRACKET_CLOSE)}])(?=[^{re.escape(_BRACKET_CLOSE + _BRACKET_OPEN)}\s])"
 )
 
-_SQUARE_BRACKET_CONTENT = re.compile(r"\[([^\]]*)\]")
-_BRACKET_TOKEN = re.compile(r"(\[[^\]]*\])")
+_TAG_DELIMITED = re.compile(r"(\[[^\]]*\]|\([^)]*\))")
+
+_TAG_OPTIONAL_SUFFIXES = (
+    re.compile(r"\s+version\.?$", re.IGNORECASE),
+    re.compile(r"\s+ver\.?$", re.IGNORECASE),
+    re.compile(r"\s+版$"),
+)
 
 _LANGUAGE_TAG_CODES = {
     "chinese": "chn",
@@ -136,9 +141,22 @@ def _collapse_spaces(name: str) -> str:
     return re.sub(r"\s+", " ", name).strip(" .")
 
 
+def _strip_optional_tag_suffix(tag: str) -> str:
+    """Remove optional trailing suffixes like 'version' or 'ver' from tag text."""
+    stripped = tag.strip()
+    while True:
+        updated = stripped
+        for pattern in _TAG_OPTIONAL_SUFFIXES:
+            updated = pattern.sub("", updated).strip()
+        if updated == stripped:
+            break
+        stripped = updated
+    return stripped
+
+
 def _shorten_language_tag(tag: str) -> Optional[str]:
     """Map language bracket tags to short codes like chn/eng."""
-    stripped = tag.strip()
+    stripped = _strip_optional_tag_suffix(tag.strip())
     if not stripped:
         return None
 
@@ -155,38 +173,45 @@ def _is_translator_tag(tag: str) -> bool:
 
 
 def _should_drop_bracket_tag(tag: str) -> bool:
-    lowered = tag.strip().casefold()
-    if not lowered:
-        return True
-    if lowered in _DROPPABLE_BRACKET_TAGS:
-        return True
-    return _is_translator_tag(tag)
+    candidates = {tag.strip().casefold(), _strip_optional_tag_suffix(tag).casefold()}
+    for lowered in candidates:
+        if not lowered:
+            return True
+        if lowered in _DROPPABLE_BRACKET_TAGS:
+            return True
+        if _is_translator_tag(tag):
+            return True
+    return False
 
 
 def _normalize_bracket_tag_content(tag: str) -> Optional[str]:
-    """Return normalized bracket text, or None when the tag should be removed."""
+    """Return normalized tag text, or None when the tag should be removed."""
     stripped = tag.strip()
     if not stripped:
         return None
+
+    core = _strip_optional_tag_suffix(stripped)
 
     language_code = _shorten_language_tag(stripped)
     if language_code is not None:
         return language_code
     if _should_drop_bracket_tag(stripped):
         return None
-    return stripped.casefold()
+    return core.casefold()
 
 
-def _normalize_square_bracket_tags(name: str) -> str:
-    """Shorten language tags, drop metadata/translator tags, lowercase the rest."""
+def _normalize_delimited_tags(name: str) -> str:
+    """Normalize [...] and (...) tags with the same rules."""
 
     def replace(match: re.Match[str]) -> str:
-        normalized = _normalize_bracket_tag_content(match.group(1))
+        token = match.group(0)
+        opener, closer = token[0], token[-1]
+        normalized = _normalize_bracket_tag_content(token[1:-1])
         if normalized is None:
             return " "
-        return f"[{normalized}]"
+        return f"{opener}{normalized}{closer}"
 
-    return _SQUARE_BRACKET_CONTENT.sub(replace, name)
+    return _TAG_DELIMITED.sub(replace, name)
 
 
 def _title_case_ascii_word(word: str) -> str:
@@ -245,11 +270,11 @@ def _title_case_segment(segment: str) -> str:
     return f"{leading}{_title_case_episode_aware(core)}{trailing}"
 
 
-def _title_case_outside_brackets(name: str) -> str:
-    """Title-case manga words outside square-bracket tags."""
-    parts = _BRACKET_TOKEN.split(name)
+def _title_case_outside_tags(name: str) -> str:
+    """Title-case manga words outside [...] and (...) tags."""
+    parts = _TAG_DELIMITED.split(name)
     return "".join(
-        part if part.startswith("[") else _title_case_segment(part)
+        part if part and part[0] in "[(" else _title_case_segment(part)
         for part in parts
     )
 
@@ -262,8 +287,8 @@ def standardize_folder_name(name: str) -> str:
     cleaned = _normalize_bracket_characters(cleaned)
     cleaned = _normalize_bracket_spacing(cleaned)
     cleaned = _collapse_spaces(cleaned)
-    cleaned = _normalize_square_bracket_tags(cleaned)
-    cleaned = _title_case_outside_brackets(cleaned)
+    cleaned = _normalize_delimited_tags(cleaned)
+    cleaned = _title_case_outside_tags(cleaned)
     cleaned = _collapse_spaces(cleaned)
     return cleaned or name.strip()
 
