@@ -69,6 +69,7 @@ MangaKeeper processes your collection in four phases:
 | `--dry-run` | Preview changes without modifying any files | `False` |
 | `--keep-originals` | Keep original files after CBZ conversion | `False` |
 | `--threshold` | Perceptual hash distance threshold for duplicate detection | `10` |
+| `--log-file` | Path to write a detailed operation log | None |
 
 ## License
 

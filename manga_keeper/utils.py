@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import shutil
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None  # type: ignore[assignment]
 
 PathLike = Union[str, Path]
 
@@ -140,6 +146,61 @@ def list_archive_images(file_path: PathLike) -> List[str]:
     return []
 
 
+def _archive_first_image_bytes(path: Path) -> Optional[bytes]:
+    """Read the first image member from a CBZ/CBR/ZIP archive."""
+    names = list_archive_images(path)
+    if not names:
+        return None
+
+    suffix = path.suffix.lower()
+    first = names[0]
+
+    if suffix == ".cbr":
+        try:
+            import rarfile
+        except ImportError:
+            return None
+        try:
+            with rarfile.RarFile(path) as archive:
+                return archive.read(first)
+        except (rarfile.Error, OSError):
+            return None
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            return archive.read(first)
+    except (zipfile.BadZipFile, OSError):
+        return None
+
+
+def _image_dimensions_from_bytes(data: bytes) -> Tuple[Optional[int], Optional[int]]:
+    if Image is None:
+        return None, None
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            return int(img.width), int(img.height)
+    except (OSError, ValueError):
+        return None, None
+
+
+def _document_first_page_dimensions(path: Path) -> Tuple[Optional[int], Optional[int]]:
+    try:
+        import fitz
+    except ImportError:
+        return None, None
+    try:
+        doc = fitz.open(path)
+    except Exception:
+        return None, None
+    try:
+        if doc.page_count == 0:
+            return None, None
+        rect = doc.load_page(0).rect
+        return int(rect.width), int(rect.height)
+    finally:
+        doc.close()
+
+
 def get_comic_metadata(file_path: PathLike) -> Optional[Dict[str, Any]]:
     """Return page count and representative dimensions for a comic file."""
     path = Path(file_path)
@@ -150,52 +211,34 @@ def get_comic_metadata(file_path: PathLike) -> Optional[Dict[str, Any]]:
         names = list_archive_images(path)
         if not names:
             return None
+        width = height = None
+        data = _archive_first_image_bytes(path)
+        if data:
+            width, height = _image_dimensions_from_bytes(data)
         return {
             "page_count": len(names),
-            "width": None,
-            "height": None,
+            "width": width,
+            "height": height,
         }
 
-    if suffix == ".pdf":
+    if suffix in {".pdf", ".epub"}:
         try:
-            import fitz
+            import fitz  # noqa: F401
         except ImportError:
-            log.error("pymupdf not installed; cannot read PDF metadata for %s", path)
+            log.error("pymupdf not installed; cannot read %s metadata for %s", suffix, path)
             return None
         try:
             doc = fitz.open(path)
         except Exception as exc:
-            log.warning("Cannot open PDF %s: %s", path, exc)
+            log.warning("Cannot open %s %s: %s", suffix, path, exc)
             return None
         try:
-            page_count = doc.page_count
-            width = height = None
-            if page_count:
-                page = doc.load_page(0)
-                rect = page.rect
-                width = int(rect.width)
-                height = int(rect.height)
+            width, height = _document_first_page_dimensions(path)
             return {
-                "page_count": page_count,
+                "page_count": doc.page_count,
                 "width": width,
                 "height": height,
             }
-        finally:
-            doc.close()
-
-    if suffix == ".epub":
-        try:
-            import fitz
-        except ImportError:
-            log.error("pymupdf not installed; cannot read EPUB metadata for %s", path)
-            return None
-        try:
-            doc = fitz.open(path)
-        except Exception as exc:
-            log.warning("Cannot open EPUB %s: %s", path, exc)
-            return None
-        try:
-            return {"page_count": doc.page_count, "width": None, "height": None}
         finally:
             doc.close()
 
