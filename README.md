@@ -7,7 +7,7 @@ A Python CLI tool to organize manga and comic collections by removing duplicates
 - **Exact duplicate detection** via SHA256 — files with identical content are identified and deduplicated
 - **Perceptual duplicate detection** via page hashing — different scans or encodes of the same title are detected using perceptual image hashing on sampled pages
 - **Quality-based selection** — when duplicates are found, the best version (page count, resolution, file size) is kept automatically
-- **PNG pages + folder naming** — page images are converted to lossless PNG (keeping their original filenames), and comic folders are renamed to a cleaned standard convention
+- **PNG pages + folder naming** — page images are converted to PNG with a size budget (at most 2× the original page file, preferring resize over quality loss), keeping their original filenames; comic folders are renamed to a cleaned standard convention
 
 ## Prerequisites
 
@@ -45,7 +45,7 @@ python3 -m manga_keeper.cli --path /path/to/manga --keep-originals --threshold 1
 
 ## How It Works
 
-MangaKeeper processes your collection in four phases:
+MangaKeeper processes your collection in six phases (episode combining runs by default after standardization):
 
 1. **Scan** — Recursively scans the target directory for comic files (CBZ, CBR, ZIP, PDF, EPUB) and folders containing page images (JPG, PNG, WebP, etc.).
 
@@ -53,9 +53,22 @@ MangaKeeper processes your collection in four phases:
 
 3. **Perceptual Dedup** — Samples pages from each archive and computes perceptual hashes. Files with similar page signatures (below the threshold) are grouped as duplicates of the same title. The highest-quality version is kept.
 
-4. **Standardize** — Converts page images to lossless PNG (original filenames preserved) and renames comic folders to a cleaned standard convention: bracket variants normalized to ASCII `[]` / `()`, no double spaces, spaces around bracket groups, duplicate markers removed. Archives are extracted into a standardized folder.
+4. **Standardize** — Converts page images to PNG (original filenames preserved) using a per-page size budget. Each PNG must be no larger than the stricter of **2× the source page file** or **`--max-page-size-mb`** (default: 2 MB). When a straight PNG conversion would exceed that budget, MangaKeeper shrinks the page first and only reduces color depth as a last resort. Folder names are cleaned to a standard convention: bracket variants normalized to ASCII `[]` / `()`, no double spaces, spaces around bracket groups, duplicate markers removed. Archives are extracted into a standardized folder. Converted page originals are moved to trash by default.
 
-5. **Suggest artists** *(optional)* — Learns visual style profiles from tagged folders like `[Artist A] Title` and suggests likely artists for untagged comics based on page similarity.
+5. **Combine episodes** — Detects contiguous episode folders (for example `manga_a_episode_1` + `manga_a_episode_2`) and merges them into a single folder such as `manga_a_episode_1to2`. Pages are prefixed by episode (`e01_001.webp`, `e02_001.webp`, …) to avoid filename collisions. Non-contiguous gaps (for example episodes 1 and 3 without 2) are skipped. Prompts per group; Enter accepts the default. Use `--skip-combine-episodes` to skip this phase.
+
+6. **Suggest artists** *(optional)* — Learns visual style profiles from tagged folders like `[Artist A] Title` and suggests likely artists for untagged comics based on page similarity.
+
+## Episode combining
+
+When a series is split into per-episode folders, MangaKeeper can merge **contiguous** runs into one folder:
+
+```bash
+python3 -m manga_keeper.cli --path /path/to/manga --combine-episodes-only --dry-run
+python3 -m manga_keeper.cli --path /path/to/manga --skip-combine-episodes
+```
+
+Supported naming patterns include `_episode_N`, `_ep_N`, `_ch_N`, trailing ` N`, `-N`, `#N`, and CJK forms like `第N话`. Already-merged names such as `_episode_1to2` are skipped.
 
 ## Artist suggestions
 
@@ -84,8 +97,8 @@ Unchanged comics skip re-listing their page files during scan and skip re-hashin
 
 ## Safety Features
 
-- **Confirmation prompts** — Phases 2 and 3 ask before removing duplicates (Enter accepts the default). Phase 3 lets you pick which version to keep, with page counts shown for each copy. Phase 4 automatically renames folders and converts pages to PNG without prompting.
-- **Trash instead of delete** — Removed files are moved to `.manga_keeper_trash/` rather than permanently deleted
+- **Confirmation prompts** — Phases 2, 3, and 5 ask before removing or merging (Enter accepts the default). Phase 3 lets you pick which version to keep, with page counts shown for each copy. Phase 4 automatically renames folders and converts pages to PNG without prompting.
+- **Trash instead of delete** — Removed duplicates, merged episode folders, converted page originals, and extracted archives are moved to `.manga_keeper_trash/` preserving their library-relative folder structure
 - **Dry-run mode** — Preview all actions without making any changes to your files
 
 ## CLI Arguments
@@ -94,13 +107,17 @@ Unchanged comics skip re-listing their page files during scan and skip re-hashin
 |---|---|---|
 | `--path` | Path to the directory containing comic files | Required |
 | `--dry-run` | Preview changes without modifying any files | `False` |
-| `--keep-originals` | Keep original files after PNG normalization | `False` |
+| `--keep-originals` | Keep original page files and archives after PNG normalization | `False` |
+| `--max-page-size-mb` | Maximum output PNG size per page in megabytes (also capped at 2× source size) | `2` |
+| `--workers` | Parallel workers for phase 4 page conversion | CPU core count |
 | `--threshold` | Perceptual hash distance threshold for duplicate detection | `10` |
 | `--log-file` | Path to write a detailed operation log | None |
 | `--rebuild-cache` | Ignore and rebuild the local scan/hash index | `False` |
 | `--suggest-artists` | Suggest artist tags for untagged comics after the normal pipeline | `False` |
 | `--artists-only` | Scan and run artist suggestions only | `False` |
 | `--standardize-only` | Scan and run folder/PNG standardization (phase 4) only | `False` |
+| `--skip-combine-episodes` | Skip merging contiguous episode folders (phase 5) | `False` |
+| `--combine-episodes-only` | Scan and merge contiguous episode folders only | `False` |
 | `--artist-min-samples` | Minimum tagged works required to learn an artist profile | `3` |
 | `--artist-threshold` | Visual similarity threshold for artist suggestions | `12` |
 | `--apply-artist-tags` | Prompt to rename untagged folders when a match is suggested | `False` |

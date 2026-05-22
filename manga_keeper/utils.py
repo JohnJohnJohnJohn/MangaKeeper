@@ -99,7 +99,12 @@ def setup_logging(log_file: Optional[PathLike] = None) -> logging.Logger:
     return logger
 
 
-def move_to_trash(file_path: PathLike, trash_dir: Optional[PathLike] = None) -> Optional[Path]:
+def move_to_trash(
+    file_path: PathLike,
+    trash_dir: Optional[PathLike] = None,
+    *,
+    library_root: Optional[PathLike] = None,
+) -> Optional[Path]:
     src = Path(file_path)
     log = logging.getLogger(__name__)
 
@@ -112,17 +117,25 @@ def move_to_trash(file_path: PathLike, trash_dir: Optional[PathLike] = None) -> 
     else:
         trash_path = Path(trash_dir)
 
-    trash_path.mkdir(parents=True, exist_ok=True)
+    if library_root is not None:
+        try:
+            relative = src.resolve().relative_to(Path(library_root).resolve())
+            target = trash_path / relative
+        except ValueError:
+            target = trash_path / src.name
+    else:
+        target = trash_path / src.name
 
-    target = trash_path / src.name
+    target.parent.mkdir(parents=True, exist_ok=True)
+
     counter = 1
     while target.exists():
-        target = trash_path / f"{src.stem}__{counter}{src.suffix}"
+        target = target.parent / f"{target.stem}__{counter}{target.suffix}"
         counter += 1
 
     try:
         shutil.move(str(src), str(target))
-        log.info("Moved %s -> %s", src, target)
+        log.debug("Moved %s -> %s", src, target)
         return target
     except OSError as exc:
         log.error("Failed to move %s to trash: %s", src, exc)

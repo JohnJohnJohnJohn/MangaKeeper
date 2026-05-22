@@ -21,13 +21,16 @@ from manga_keeper.scanner import scan_directory
 from manga_keeper.hasher import find_exact_duplicates, select_file_to_keep
 from manga_keeper.perceptual import find_perceptual_duplicates
 from manga_keeper.resolver import get_quality_score
-from manga_keeper.naming import standard_folder_name
 from manga_keeper.converter import (
+    default_worker_count,
     needs_conversion,
-    needs_folder_rename,
-    needs_png_conversion,
     standardize_comic,
     standardize_comic_with_cleanup,
+)
+from manga_keeper.episodes import (
+    EpisodeMergeGroup,
+    find_episode_merge_groups,
+    merge_episode_group,
 )
 from manga_keeper.utils import (
     setup_logging,
@@ -153,7 +156,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="manga-keeper",
         description=(
             "Scan a directory of manga/comics, deduplicate them (exact + perceptual), "
-            "and normalize pages to lossless PNG."
+            "and normalize pages to size-budget PNG."
         ),
     )
     parser.add_argument(
@@ -176,6 +179,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep-originals",
         action="store_true",
         help="Keep the original files after PNG normalization (do not move to trash).",
+    )
+    parser.add_argument(
+        "--max-page-size-mb",
+        type=float,
+        default=2.0,
+        metavar="MB",
+        help=(
+            "Maximum output PNG size per page in megabytes during phase 4. "
+            "The converter uses the stricter of this limit and 2x the source page size. "
+            "Default: 2."
+        ),
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help=(
+            "Parallel workers for phase 4 page conversion. "
+            "Default: number of CPU cores."
+        ),
     )
     parser.add_argument(
         "--log-file",
@@ -201,6 +224,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--standardize-only",
         action="store_true",
         help="Scan the library and run folder/PNG standardization (phase 4) only.",
+    )
+    parser.add_argument(
+        "--skip-combine-episodes",
+        action="store_true",
+        help="Skip merging contiguous episode folders (phase 5) during the normal pipeline.",
+    )
+    parser.add_argument(
+        "--combine-episodes-only",
+        action="store_true",
+        help="Scan the library and merge contiguous episode folders only.",
     )
     parser.add_argument(
         "--artist-min-samples",
@@ -239,12 +272,18 @@ def _trash_files(
     files_to_remove: Iterable[Path],
     trash_dir: Path,
     log: logging.Logger,
+    *,
+    library_root: Optional[Path] = None,
 ) -> int:
     reclaimed = 0
     for victim in files_to_remove:
         size = _safe_size(victim)
         try:
-            moved = move_to_trash(victim, trash_dir=trash_dir)
+            moved = move_to_trash(
+                victim,
+                trash_dir=trash_dir,
+                library_root=library_root,
+            )
         except Exception as exc:
             log.error("Unexpected error trashing %s: %s", victim, exc)
             continue
@@ -263,6 +302,7 @@ def _phase_exact_duplicates(
     log: logging.Logger,
     index: Optional[ComicIndex] = None,
     *,
+    library_root: Optional[Path] = None,
     use_cache: bool = True,
 ) -> tuple[List[Path], int, int]:
     _header("Phase 2: Removing Exact Duplicates")
@@ -306,7 +346,9 @@ def _phase_exact_duplicates(
             _warn("  Skipped this group.")
             continue
 
-        reclaimed += _trash_files(remove, trash_dir, log)
+        reclaimed += _trash_files(
+            remove, trash_dir, log, library_root=library_root
+        )
         removed.update(remove)
         if index is not None:
             index.remove_many(remove)
@@ -335,6 +377,7 @@ def _phase_perceptual_duplicates(
     log: logging.Logger,
     index: Optional[ComicIndex] = None,
     *,
+    library_root: Optional[Path] = None,
     use_cache: bool = True,
 ) -> tuple[List[Path], int, int]:
     _header("Phase 3: Removing Perceptual Duplicates")
@@ -388,7 +431,9 @@ def _phase_perceptual_duplicates(
             _warn("  Skipped this group.")
             continue
 
-        reclaimed += _trash_files(remove, trash_dir, log)
+        reclaimed += _trash_files(
+            remove, trash_dir, log, library_root=library_root
+        )
         removed.update(remove)
         if index is not None:
             index.remove_many(remove)
@@ -416,6 +461,10 @@ def _phase_conversion(
     keep_originals: bool,
     log: logging.Logger,
     comic_index: Optional[ComicIndex] = None,
+    *,
+    library_root: Optional[Path] = None,
+    max_page_size_mb: float = 2.0,
+    workers: int = 1,
 ) -> tuple[int, int]:
     _header("Phase 4: Standardizing Comics")
 
@@ -434,7 +483,8 @@ def _phase_conversion(
     print(
         _color(
             f"Automatically standardizing {len(candidates)} comic(s) "
-            f"(folder rename + PNG pages; no prompts) ...",
+            f"(folder rename + PNG pages; max {max_page_size_mb:g} MB/page; "
+            f"{workers} worker(s); no prompts) ...",
             "bold",
         )
     )
@@ -443,43 +493,49 @@ def _phase_conversion(
     bytes_delta = 0
 
     for step, path in enumerate(candidates, start=1):
-        actions: List[str] = []
-        if needs_folder_rename(path):
-            actions.append(f"rename -> {standard_folder_name(path)}")
-        if needs_png_conversion(path):
-            actions.append("convert pages to PNG")
-
-        print()
-        print(_color(f"[{step}/{len(candidates)}]", "bold") + f" {path}")
-        if actions:
-            print(f"  {_color('actions', 'magenta')}: {', '.join(actions)}")
-
         if dry_run:
-            _warn("  Dry run: would apply automatically.")
+            _warn(f"  [{step}/{len(candidates)}] Dry run: would standardize {path.name}")
             continue
 
         pre_size = _safe_size(path)
         try:
             if is_image_folder(path):
-                output = standardize_comic(path)
+                output = standardize_comic(
+                    path,
+                    trash_dir=trash_dir,
+                    library_root=library_root,
+                    keep_originals=keep_originals,
+                    max_page_size_mb=max_page_size_mb,
+                    workers=workers,
+                )
             else:
                 output = standardize_comic_with_cleanup(
                     path,
                     keep_originals=keep_originals,
                     trash_dir=trash_dir,
+                    library_root=library_root,
+                    max_page_size_mb=max_page_size_mb,
+                    workers=workers,
                 )
         except Exception as exc:
             log.error("Standardization failed for %s: %s", path, exc)
-            _err(f"  Failed to standardize {path.name}")
+            _err(f"  [{step}/{len(candidates)}] Failed to standardize {path.name}")
             continue
 
         if output is None:
-            _err(f"  Failed to standardize {path.name}")
+            _err(f"  [{step}/{len(candidates)}] Failed to standardize {path.name}")
             continue
 
         changed += 1
         bytes_delta += pre_size - _safe_size(output)
-        _ok(f"  Standardized -> {output}")
+        pages = _comic_page_count(output)
+        if output.name != path.name:
+            _ok(
+                f"  [{step}/{len(candidates)}] {path.name} -> {output.name} "
+                f"({pages} pages)"
+            )
+        else:
+            _ok(f"  [{step}/{len(candidates)}] {path.name} ({pages} pages)")
         if comic_index is not None:
             comic_index.remove(path)
             comic_index.ensure_metadata(output)
@@ -507,6 +563,95 @@ def _unique_folder_path(parent: Path, folder_name: str) -> Path:
     return candidate
 
 
+def _format_episode_merge_group(group: EpisodeMergeGroup) -> str:
+    parts = []
+    for info in group.episodes:
+        pages = len(list_folder_images(info.folder))
+        parts.append(f"{info.folder.name} ({pages} pages)")
+    return " + ".join(parts)
+
+
+def _phase_combine_episodes(
+    files: List[Path],
+    trash_dir: Path,
+    dry_run: bool,
+    log: logging.Logger,
+    comic_index: Optional[ComicIndex] = None,
+    *,
+    library_root: Optional[Path] = None,
+) -> tuple[List[Path], int]:
+    _header("Phase 5: Combining Contiguous Episodes")
+
+    groups = find_episode_merge_groups(files)
+    if not groups:
+        _ok("No contiguous episode groups found.")
+        return files, 0
+
+    merged_paths: List[Path] = []
+    removed: Set[Path] = set()
+    group_count = 0
+
+    for group in groups:
+        group_count += 1
+        merged_name = group.merged_name()
+        total_pages = group.total_pages()
+
+        print()
+        print(_color(f"Episode merge group {group_count}:", "bold"))
+        print(f"  {_format_episode_merge_group(group)}")
+        print(
+            f"  {_color('MERGE', 'magenta')} -> {merged_name} "
+            f"({total_pages} pages total; pages prefixed eNN_...)"
+        )
+
+        if dry_run:
+            _warn("  Dry run: would prompt to merge this group.")
+            continue
+
+        if not _confirm(
+            _color("  Merge these contiguous episodes? [Y/n]", "yellow")
+        ):
+            _warn("  Skipped this group.")
+            continue
+
+        try:
+            output = merge_episode_group(
+                group,
+                trash_dir=trash_dir,
+                library_root=library_root,
+                dry_run=False,
+            )
+        except Exception as exc:
+            log.error("Episode merge failed for %s: %s", merged_name, exc)
+            _err(f"  Failed to merge into {merged_name}")
+            continue
+
+        if output is None:
+            _err(f"  Failed to merge into {merged_name}")
+            continue
+
+        merged_paths.append(output)
+        removed.update(group.source_folders)
+        if comic_index is not None:
+            comic_index.remove_many(group.source_folders)
+            comic_index.ensure_metadata(output)
+
+        _ok(f"  Merged -> {output}")
+
+    if group_count == 0:
+        _ok("No contiguous episode groups found.")
+    elif dry_run:
+        _warn("Dry run: no episode folders were merged.")
+    elif merged_paths:
+        _ok(f"Merged {len(merged_paths)} episode group(s).")
+    else:
+        _warn("No episode groups were merged.")
+
+    remaining = [path for path in files if path not in removed]
+    remaining.extend(merged_paths)
+    return remaining, len(merged_paths)
+
+
 def _phase_artist_suggestions(
     files: List[Path],
     dry_run: bool,
@@ -518,7 +663,7 @@ def _phase_artist_suggestions(
     threshold: int = 12,
     apply_tags: bool = False,
 ) -> int:
-    _header("Phase 5: Suggesting Artist Tags")
+    _header("Phase 6: Suggesting Artist Tags")
 
     tagged = [path for path in files if extract_artist_tag(path.name)]
     untagged = [path for path in files if is_untagged_comic(path)]
@@ -626,8 +771,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception:
             pass
 
-    if args.artists_only and args.standardize_only:
-        _err("Choose only one of --artists-only or --standardize-only.")
+    exclusive_modes = sum(
+        bool(flag)
+        for flag in (
+            args.artists_only,
+            args.standardize_only,
+            args.combine_episodes_only,
+        )
+    )
+    if exclusive_modes > 1:
+        _err(
+            "Choose only one of --artists-only, --standardize-only, "
+            "or --combine-episodes-only."
+        )
         return 2
 
     root = Path(args.path).expanduser().resolve()
@@ -636,6 +792,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
     if not root.is_dir():
         _err(f"Path is not a directory: {root}")
+        return 2
+    if args.max_page_size_mb <= 0:
+        _err("--max-page-size-mb must be greater than 0.")
+        return 2
+    workers = args.workers if args.workers > 0 else default_worker_count()
+    if workers < 1:
+        _err("--workers must be at least 1.")
         return 2
 
     trash_dir = root / ".manga_keeper_trash"
@@ -650,6 +813,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"  threshold: {args.threshold}")
     print(f"  dry-run:   {args.dry_run}")
     print(f"  keep-originals: {args.keep_originals}")
+    print(f"  max-page-size: {args.max_page_size_mb:g} MB")
+    print(f"  workers:   {workers}")
     print(f"  cache:     {'rebuild' if not use_cache else f'{len(index)} record(s)'}")
     if args.suggest_artists or args.artists_only:
         print(f"  artists:   min-samples={args.artist_min_samples}, threshold={args.artist_threshold}")
@@ -673,16 +838,52 @@ def main(argv: Optional[List[str]] = None) -> int:
     exact_removed = perceptual_removed = 0
     exact_bytes = perceptual_bytes = 0
     converted = converted_bytes_delta = 0
+    episodes_merged = 0
     artist_suggestions = 0
+    run_combine_episodes = args.combine_episodes_only or (
+        not args.skip_combine_episodes and not args.artists_only
+    )
 
     try:
-        if args.standardize_only:
-            converted, converted_bytes_delta = _phase_conversion(
-                files, trash_dir, args.dry_run, args.keep_originals, log, comic_index=index
+        if args.combine_episodes_only:
+            files, episodes_merged = _phase_combine_episodes(
+                files,
+                trash_dir,
+                args.dry_run,
+                log,
+                comic_index=index,
+                library_root=root,
             )
+        elif args.standardize_only:
+            converted, converted_bytes_delta = _phase_conversion(
+                files,
+                trash_dir,
+                args.dry_run,
+                args.keep_originals,
+                log,
+                comic_index=index,
+                library_root=root,
+                max_page_size_mb=args.max_page_size_mb,
+                workers=workers,
+            )
+            if run_combine_episodes:
+                files, episodes_merged = _phase_combine_episodes(
+                    files,
+                    trash_dir,
+                    args.dry_run,
+                    log,
+                    comic_index=index,
+                    library_root=root,
+                )
         elif not args.artists_only:
             files, exact_removed, exact_bytes = _phase_exact_duplicates(
-                files, trash_dir, args.dry_run, log, index, use_cache=use_cache
+                files,
+                trash_dir,
+                args.dry_run,
+                log,
+                index,
+                library_root=root,
+                use_cache=use_cache,
             )
 
             files, perceptual_removed, perceptual_bytes = _phase_perceptual_duplicates(
@@ -692,12 +893,31 @@ def main(argv: Optional[List[str]] = None) -> int:
                 args.dry_run,
                 log,
                 index,
+                library_root=root,
                 use_cache=use_cache,
             )
 
             converted, converted_bytes_delta = _phase_conversion(
-                files, trash_dir, args.dry_run, args.keep_originals, log, comic_index=index
+                files,
+                trash_dir,
+                args.dry_run,
+                args.keep_originals,
+                log,
+                comic_index=index,
+                library_root=root,
+                max_page_size_mb=args.max_page_size_mb,
+                workers=workers,
             )
+
+            if run_combine_episodes:
+                files, episodes_merged = _phase_combine_episodes(
+                    files,
+                    trash_dir,
+                    args.dry_run,
+                    log,
+                    comic_index=index,
+                    library_root=root,
+                )
 
         if args.suggest_artists or args.artists_only:
             artist_suggestions = _phase_artist_suggestions(
@@ -734,6 +954,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"  Comics standardized:      {converted} "
         f"(net {format_size(converted_bytes_delta)})"
     )
+    if run_combine_episodes:
+        print(f"  Episode groups merged:    {episodes_merged}")
     if args.suggest_artists or args.artists_only:
         print(f"  Artist suggestions:       {artist_suggestions}")
     print(
