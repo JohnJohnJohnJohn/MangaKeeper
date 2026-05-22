@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 import shutil
 import zipfile
 from pathlib import Path
@@ -18,9 +19,56 @@ PathLike = Union[str, Path]
 
 DEFAULT_TRASH_DIR_NAME = ".manga_keeper_trash"
 
-_IMAGE_SUFFIXES = frozenset(
+IMAGE_SUFFIXES = frozenset(
     {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
 )
+_IMAGE_SUFFIXES = IMAGE_SUFFIXES
+
+
+def _natural_key(name: str) -> List:
+    parts = re.split(r"(\d+)", name.lower())
+    return [int(p) if p.isdigit() else p for p in parts]
+
+
+def is_image_file(path: PathLike) -> bool:
+    return Path(path).suffix.lower() in _IMAGE_SUFFIXES
+
+
+def is_image_folder(path: PathLike) -> bool:
+    """Return True if ``path`` is a directory with image files as direct children."""
+    folder = Path(path)
+    if not folder.is_dir():
+        return False
+    try:
+        for entry in folder.iterdir():
+            if entry.is_file() and is_image_file(entry):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def list_folder_images(folder_path: PathLike) -> List[Path]:
+    """Return image files in ``folder_path`` (direct children only), naturally sorted."""
+    folder = Path(folder_path)
+    if not folder.is_dir():
+        return []
+    images = [
+        entry.resolve()
+        for entry in folder.iterdir()
+        if entry.is_file() and is_image_file(entry)
+    ]
+    return sorted(images, key=lambda p: _natural_key(p.name))
+
+
+def folder_content_size(folder_path: PathLike) -> int:
+    total = 0
+    for image in list_folder_images(folder_path):
+        try:
+            total += image.stat().st_size
+        except OSError:
+            continue
+    return total
 
 
 def setup_logging(log_file: Optional[PathLike] = None) -> logging.Logger:
@@ -56,7 +104,7 @@ def move_to_trash(file_path: PathLike, trash_dir: Optional[PathLike] = None) -> 
     log = logging.getLogger(__name__)
 
     if not src.exists():
-        log.warning("Cannot move to trash, file not found: %s", src)
+        log.warning("Cannot move to trash, path not found: %s", src)
         return None
 
     if trash_dir is None:
@@ -202,10 +250,26 @@ def _document_first_page_dimensions(path: Path) -> Tuple[Optional[int], Optional
 
 
 def get_comic_metadata(file_path: PathLike) -> Optional[Dict[str, Any]]:
-    """Return page count and representative dimensions for a comic file."""
+    """Return page count and representative dimensions for a comic file or image folder."""
     path = Path(file_path)
     suffix = path.suffix.lower()
     log = logging.getLogger(__name__)
+
+    if is_image_folder(path):
+        images = list_folder_images(path)
+        if not images:
+            return None
+        width = height = None
+        try:
+            data = images[0].read_bytes()
+            width, height = _image_dimensions_from_bytes(data)
+        except OSError as exc:
+            log.warning("Cannot read first image in folder %s: %s", path, exc)
+        return {
+            "page_count": len(images),
+            "width": width,
+            "height": height,
+        }
 
     if suffix in {".cbz", ".cbr", ".zip"}:
         names = list_archive_images(path)

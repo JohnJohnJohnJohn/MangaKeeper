@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple, Union
 
-from .utils import get_comic_metadata
+from .utils import folder_content_size, get_comic_metadata
 
 PathLike = Union[str, Path]
 
@@ -26,7 +26,10 @@ def get_quality_score(file_path: PathLike) -> QualityScore:
     pixel_area = width * height
 
     try:
-        file_size = path.stat().st_size if path.exists() else 0
+        if path.is_dir():
+            file_size = folder_content_size(path)
+        else:
+            file_size = path.stat().st_size if path.exists() else 0
     except OSError:
         file_size = 0
 

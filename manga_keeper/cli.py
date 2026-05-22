@@ -8,12 +8,21 @@ import sys
 from pathlib import Path
 from typing import Iterable, List, Optional, Set
 
+from manga_keeper.index import ComicIndex, index_file_for
 from manga_keeper.scanner import scan_directory
 from manga_keeper.hasher import find_exact_duplicates, select_file_to_keep
 from manga_keeper.perceptual import find_perceptual_duplicates
-from manga_keeper.resolver import resolve_duplicates
-from manga_keeper.converter import needs_conversion, convert_all
-from manga_keeper.utils import setup_logging, move_to_trash, format_size
+from manga_keeper.resolver import get_quality_score
+from manga_keeper.converter import needs_conversion, standardize_comic_with_cleanup
+from manga_keeper.utils import (
+    setup_logging,
+    move_to_trash,
+    format_size,
+    folder_content_size,
+    get_comic_metadata,
+    is_image_folder,
+    list_folder_images,
+)
 
 _ANSI = {
     "reset": "\033[0m",
@@ -55,12 +64,73 @@ def _err(text: str) -> None:
     print(_color(text, "red"))
 
 
-def _confirm(prompt: str) -> bool:
+def _confirm(prompt: str, *, default: bool = True) -> bool:
     try:
         answer = input(f"{prompt} ").strip().lower()
     except EOFError:
+        return default
+    if not answer:
+        return default
+    if answer in ("n", "no"):
         return False
     return answer in ("y", "yes")
+
+
+def _comic_page_count(path: Path) -> int:
+    if is_image_folder(path):
+        return len(list_folder_images(path))
+    meta = get_comic_metadata(path) or {}
+    return int(meta.get("page_count") or 0)
+
+
+def _format_comic_label(path: Path, *, recommended: bool = False) -> str:
+    pages = _comic_page_count(path)
+    size = format_size(_safe_size(path))
+    suffix = "  (recommended)" if recommended else ""
+    if path.is_dir():
+        detail = f"{pages} pages, {size}"
+    else:
+        detail = f"{pages} pages, {size} file"
+    return f"{path} ({detail}){suffix}"
+
+
+def _rank_comic_group(group: List[Path]) -> List[Path]:
+    scored = [(get_quality_score(path), path) for path in group]
+    scored.sort(key=lambda item: (-item[0][0], -item[0][1], -item[0][2], str(item[1]).lower()))
+    return [path for _, path in scored]
+
+
+def _prompt_keep_choice(group: List[Path]) -> Optional[Path]:
+    ordered = _rank_comic_group(group)
+    if not ordered:
+        return None
+
+    print("  Choose which version to keep:")
+    for number, path in enumerate(ordered, start=1):
+        print(f"    {number}. {_format_comic_label(path, recommended=(number == 1))}")
+
+    default_choice = 1
+    while True:
+        try:
+            raw = input(
+                _color(f"  Enter number to keep [{default_choice}]: ", "yellow")
+            ).strip()
+        except EOFError:
+            return ordered[default_choice - 1]
+
+        if not raw:
+            return ordered[default_choice - 1]
+
+        try:
+            choice = int(raw)
+        except ValueError:
+            _warn("  Invalid choice; enter a number from the list.")
+            continue
+
+        if 1 <= choice <= len(ordered):
+            return ordered[choice - 1]
+
+        _warn(f"  Invalid choice; enter a number between 1 and {len(ordered)}.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -68,7 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="manga-keeper",
         description=(
             "Scan a directory of manga/comics, deduplicate them (exact + perceptual), "
-            "and convert archives to CBZ."
+            "and normalize pages to lossless PNG."
         ),
     )
     parser.add_argument(
@@ -90,19 +160,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--keep-originals",
         action="store_true",
-        help="Keep the original files after CBZ conversion (do not move to trash).",
+        help="Keep the original files after PNG normalization (do not move to trash).",
     )
     parser.add_argument(
         "--log-file",
         default=None,
         help="Path to write a detailed operation log.",
     )
+    parser.add_argument(
+        "--rebuild-cache",
+        action="store_true",
+        help="Ignore and rebuild the local scan/hash index.",
+    )
     return parser
 
 
 def _safe_size(path: Path) -> int:
     try:
-        return path.stat().st_size if path.exists() else 0
+        if not path.exists():
+            return 0
+        if is_image_folder(path):
+            return folder_content_size(path)
+        if path.is_dir():
+            return 0
+        return path.stat().st_size
     except OSError:
         return 0
 
@@ -133,10 +214,13 @@ def _phase_exact_duplicates(
     trash_dir: Path,
     dry_run: bool,
     log: logging.Logger,
+    index: Optional[ComicIndex] = None,
+    *,
+    use_cache: bool = True,
 ) -> tuple[List[Path], int, int]:
     _header("Phase 2: Removing Exact Duplicates")
     try:
-        groups = find_exact_duplicates(files)
+        groups = find_exact_duplicates(files, index=index, use_cache=use_cache)
     except Exception as exc:
         log.error("Exact duplicate detection failed: %s", exc)
         return files, 0, 0
@@ -145,50 +229,54 @@ def _phase_exact_duplicates(
         _ok("No exact duplicates found.")
         return files, 0, 0
 
-    plan: List[tuple[Path, List[Path]]] = []
+    removed: Set[Path] = set()
+    reclaimed = 0
+    group_count = 0
+
     for digest, group in groups.items():
         try:
             keep, remove = select_file_to_keep(group)
         except ValueError:
             continue
-        plan.append((keep, remove))
 
-    total_dupes = sum(len(r) for _, r in plan)
-    print(
-        _color(
-            f"Found {len(plan)} duplicate group(s) covering {total_dupes} extra file(s):",
-            "bold",
-        )
-    )
-    for keep, remove in plan:
+        if not remove:
+            continue
+
+        group_count += 1
+        print()
+        print(_color(f"Exact duplicate group {group_count}:", "bold"))
         print(f"  {_color('KEEP', 'green')}   {keep}")
         for victim in remove:
             print(f"  {_color('REMOVE', 'red')} {victim}")
 
-    if dry_run:
-        _warn("Dry run: no files were moved.")
-        return files, 0, 0
+        if dry_run:
+            _warn("  Dry run: would prompt to remove this group.")
+            continue
 
-    if total_dupes == 0:
-        return files, 0, 0
+        if not _confirm(
+            _color("  Remove the duplicate(s) in this group? [Y/n]", "yellow")
+        ):
+            _warn("  Skipped this group.")
+            continue
 
-    if not _confirm(
-        _color(f"Found {total_dupes} exact duplicates. Remove them? [y/N]", "yellow")
-    ):
-        _warn("Skipped exact duplicate removal.")
-        return files, 0, 0
-
-    removed: Set[Path] = set()
-    reclaimed = 0
-    for _, remove in plan:
         reclaimed += _trash_files(remove, trash_dir, log)
         removed.update(remove)
+        if index is not None:
+            index.remove_many(remove)
+
+    if group_count == 0:
+        _ok("No exact duplicates found.")
+    elif dry_run:
+        _warn("Dry run: no files were moved.")
+    elif removed:
+        _ok(
+            f"Removed {len(removed)} exact duplicate(s); "
+            f"reclaimed {format_size(reclaimed)}."
+        )
+    else:
+        _warn("No exact duplicates were removed.")
 
     remaining = [p for p in files if p not in removed]
-    _ok(
-        f"Removed {len(removed)} exact duplicate(s); "
-        f"reclaimed {format_size(reclaimed)}."
-    )
     return remaining, len(removed), reclaimed
 
 
@@ -198,10 +286,18 @@ def _phase_perceptual_duplicates(
     trash_dir: Path,
     dry_run: bool,
     log: logging.Logger,
+    index: Optional[ComicIndex] = None,
+    *,
+    use_cache: bool = True,
 ) -> tuple[List[Path], int, int]:
     _header("Phase 3: Removing Perceptual Duplicates")
     try:
-        groups = find_perceptual_duplicates(files, threshold=threshold)
+        groups = find_perceptual_duplicates(
+            files,
+            threshold=threshold,
+            index=index,
+            use_cache=use_cache,
+        )
     except Exception as exc:
         log.error("Perceptual duplicate detection failed: %s", exc)
         return files, 0, 0
@@ -210,54 +306,59 @@ def _phase_perceptual_duplicates(
         _ok("No perceptual duplicates found.")
         return files, 0, 0
 
-    try:
-        resolved = resolve_duplicates(groups)
-    except Exception as exc:
-        log.error("Quality resolution failed: %s", exc)
-        return files, 0, 0
-
-    plan = [(keep, remove) for keep, remove in resolved if remove]
-    total_victims = sum(len(r) for _, r in plan)
-    print(
-        _color(
-            f"Found {len(plan)} perceptual group(s) "
-            f"covering {total_victims} lower-quality file(s):",
-            "bold",
-        )
-    )
-    for keep, remove in plan:
-        print(f"  {_color('KEEP', 'green')}   {keep}")
-        for victim in remove:
-            print(f"  {_color('REMOVE', 'red')} {victim}")
-
-    if dry_run:
-        _warn("Dry run: no files were moved.")
-        return files, 0, 0
-
-    if total_victims == 0:
-        return files, 0, 0
-
-    if not _confirm(
-        _color(
-            f"Found {total_victims} perceptual duplicates. Remove the lower-quality "
-            f"copies? [y/N]",
-            "yellow",
-        )
-    ):
-        _warn("Skipped perceptual duplicate removal.")
-        return files, 0, 0
-
     removed: Set[Path] = set()
     reclaimed = 0
-    for _, remove in plan:
+    group_count = 0
+
+    for group in groups:
+        paths = [Path(path) for path in group]
+        if len(paths) < 2:
+            continue
+
+        group_count += 1
+        print()
+        print(_color(f"Perceptual duplicate group {group_count}:", "bold"))
+
+        if dry_run:
+            for number, path in enumerate(_rank_comic_group(paths), start=1):
+                print(f"    {number}. {_format_comic_label(path, recommended=(number == 1))}")
+            _warn("  Dry run: would prompt to choose which version to keep.")
+            continue
+
+        keep = _prompt_keep_choice(paths)
+        if keep is None:
+            _warn("  Skipped this group.")
+            continue
+
+        remove = [path for path in paths if path != keep]
+        print(f"  {_color('KEEP', 'green')}   {_format_comic_label(keep)}")
+        for victim in remove:
+            print(f"  {_color('REMOVE', 'red')} {_format_comic_label(victim)}")
+
+        if not _confirm(
+            _color("  Remove the other duplicate(s) in this group? [Y/n]", "yellow")
+        ):
+            _warn("  Skipped this group.")
+            continue
+
         reclaimed += _trash_files(remove, trash_dir, log)
         removed.update(remove)
+        if index is not None:
+            index.remove_many(remove)
+
+    if group_count == 0:
+        _ok("No perceptual duplicates found.")
+    elif dry_run:
+        _warn("Dry run: no files were moved.")
+    elif removed:
+        _ok(
+            f"Removed {len(removed)} perceptual duplicate(s); "
+            f"reclaimed {format_size(reclaimed)}."
+        )
+    else:
+        _warn("No perceptual duplicates were removed.")
 
     remaining = [p for p in files if p not in removed]
-    _ok(
-        f"Removed {len(removed)} perceptual duplicate(s); "
-        f"reclaimed {format_size(reclaimed)}."
-    )
     return remaining, len(removed), reclaimed
 
 
@@ -267,8 +368,9 @@ def _phase_conversion(
     dry_run: bool,
     keep_originals: bool,
     log: logging.Logger,
+    comic_index: Optional[ComicIndex] = None,
 ) -> tuple[int, int]:
-    _header("Phase 4: Converting to CBZ")
+    _header("Phase 4: Standardizing Comics")
 
     candidates: List[Path] = []
     for path in files:
@@ -279,53 +381,62 @@ def _phase_conversion(
             log.error("needs_conversion failed for %s: %s", path, exc)
 
     if not candidates:
-        _ok("Every remaining file is already CBZ.")
+        _ok("Every remaining comic already matches the standard folder convention.")
         return 0, 0
 
-    print(_color(f"{len(candidates)} file(s) need conversion:", "bold"))
-    for path in candidates:
-        print(f"  {_color('CONVERT', 'magenta')} {path}")
-
-    if dry_run:
-        _warn("Dry run: no conversions performed.")
-        return 0, 0
-
-    if not _confirm(
-        _color(f"Convert {len(candidates)} file(s) to CBZ? [y/N]", "yellow")
-    ):
-        _warn("Skipped conversion.")
-        return 0, 0
-
-    pre_sizes = {p: _safe_size(p) for p in candidates}
-
-    try:
-        results = convert_all(
-            candidates,
-            dry_run=False,
-            keep_originals=keep_originals,
-            trash_dir=trash_dir,
+    print(
+        _color(
+            f"Standardizing {len(candidates)} comic(s) "
+            f"(folder rename + lossless PNG pages) ...",
+            "bold",
         )
-    except Exception as exc:
-        log.error("Conversion batch failed: %s", exc)
-        return 0, 0
+    )
 
     converted = 0
     bytes_delta = 0
-    for src, output in results:
-        if output is None:
-            continue
-        converted += 1
-        new_size = _safe_size(output)
-        bytes_delta += pre_sizes.get(src, 0) - new_size
 
-    if converted:
+    for step, path in enumerate(candidates, start=1):
+        print()
+        print(_color(f"[{step}/{len(candidates)}]", "bold") + f" {path}")
+
+        if dry_run:
+            _warn("  Dry run: would normalize this comic.")
+            continue
+
+        pre_size = _safe_size(path)
+        try:
+            output = standardize_comic_with_cleanup(
+                path,
+                keep_originals=keep_originals,
+                trash_dir=trash_dir,
+            )
+        except Exception as exc:
+            log.error("Normalization failed for %s: %s", path, exc)
+            _err(f"  Failed to standardize {path.name}")
+            continue
+
+        if output is None:
+            _err(f"  Failed to standardize {path.name}")
+            continue
+
+        converted += 1
+        bytes_delta += pre_size - _safe_size(output)
+        _ok(f"  Standardized -> {output}")
+        if comic_index is not None:
+            comic_index.remove(path)
+            comic_index.ensure_metadata(output)
+
+    if dry_run:
+        _warn("Dry run: no standardizations performed.")
+    elif converted:
         _ok(
-            f"Converted {converted} file(s); net size change: "
+            f"Standardized {converted} comic(s); net size change: "
             f"{format_size(bytes_delta)} "
             f"{'saved' if bytes_delta >= 0 else 'grew'}."
         )
     else:
-        _warn("No files were successfully converted.")
+        _warn("No comics were standardized.")
+
     return converted, bytes_delta
 
 
@@ -334,6 +445,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     log = setup_logging(args.log_file)
+
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
     root = Path(args.path).expanduser().resolve()
     if not root.exists():
@@ -344,25 +461,32 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     trash_dir = root / ".manga_keeper_trash"
+    index_path = index_file_for(root)
+    use_cache = not args.rebuild_cache
+    index = ComicIndex.load(root, rebuild=not use_cache)
 
     print(_color("manga_keeper", "bold", "magenta"))
     print(f"  root:      {root}")
     print(f"  trash:     {trash_dir}")
+    print(f"  index:     {index_path}")
     print(f"  threshold: {args.threshold}")
     print(f"  dry-run:   {args.dry_run}")
     print(f"  keep-originals: {args.keep_originals}")
+    print(f"  cache:     {'rebuild' if not use_cache else f'{len(index)} record(s)'}")
 
     _header("Phase 1: Scanning Directory")
     try:
-        files = scan_directory(root)
+        files = scan_directory(root, index=index, use_cache=use_cache)
     except Exception as exc:
         log.error("Scan failed: %s", exc)
         _err(f"Scan failed: {exc}")
         return 1
 
     initial_count = len(files)
-    print(_color(f"Discovered {initial_count} comic file(s).", "bold"))
+    print(_color(f"Discovered {initial_count} comic(s).", "bold"))
     if initial_count == 0:
+        if not args.dry_run:
+            index.save()
         _warn("Nothing to do.")
         return 0
 
@@ -372,20 +496,31 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         files, exact_removed, exact_bytes = _phase_exact_duplicates(
-            files, trash_dir, args.dry_run, log
+            files, trash_dir, args.dry_run, log, index, use_cache=use_cache
         )
 
         files, perceptual_removed, perceptual_bytes = _phase_perceptual_duplicates(
-            files, args.threshold, trash_dir, args.dry_run, log
+            files,
+            args.threshold,
+            trash_dir,
+            args.dry_run,
+            log,
+            index,
+            use_cache=use_cache,
         )
 
         converted, converted_bytes_delta = _phase_conversion(
-            files, trash_dir, args.dry_run, args.keep_originals, log
+            files, trash_dir, args.dry_run, args.keep_originals, log, comic_index=index
         )
     except KeyboardInterrupt:
         print()
-        _warn("Interrupted by user. Exiting cleanly.")
+        _warn("Interrupted by user. Saving index before exit.")
+        if not args.dry_run:
+            index.save()
         return 130
+
+    if not args.dry_run:
+        index.save()
 
     _header("Summary")
     total_reclaimed = exact_bytes + perceptual_bytes + max(converted_bytes_delta, 0)
@@ -398,7 +533,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"({format_size(perceptual_bytes)})"
     )
     print(
-        f"  Files converted:          {converted} "
+        f"  Comics standardized:      {converted} "
         f"(net {format_size(converted_bytes_delta)})"
     )
     print(
@@ -408,6 +543,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         _warn("This was a dry run — no files were modified.")
     else:
         print(f"  Trash directory:          {trash_dir}")
+        print(f"  Index file:               {index_path}")
 
     return 0
 

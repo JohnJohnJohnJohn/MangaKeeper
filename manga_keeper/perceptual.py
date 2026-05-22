@@ -8,7 +8,7 @@ import shutil
 import tempfile
 import zipfile
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 try:
     import imagehash
@@ -17,7 +17,11 @@ except ImportError:
     imagehash = None  # type: ignore[assignment]
     Image = None  # type: ignore[assignment]
 
-from .utils import get_comic_metadata, list_archive_images
+if TYPE_CHECKING:
+    from .index import ComicIndex
+
+from .index import DEFAULT_PERCEPTUAL_PAGES, compute_content_fingerprint
+from .utils import get_comic_metadata, is_image_folder, list_archive_images, list_folder_images
 
 PathLike = Union[str, Path]
 
@@ -98,6 +102,28 @@ def _hash_image(img: Image.Image):
     if imagehash is None:
         return None
     return imagehash.phash(img)
+
+
+def _extract_from_folder(folder_path: Path, num_pages: int) -> List:
+    images = list_folder_images(folder_path)
+    if not images:
+        return []
+
+    indices = _page_indices(len(images), num_pages)
+    hashes = []
+    for idx in indices:
+        try:
+            data = images[idx].read_bytes()
+        except OSError as exc:
+            log.warning("Failed reading %s: %s", images[idx], exc)
+            continue
+        img = _load_image_bytes(data)
+        if img is None:
+            continue
+        page_hash = _hash_image(img)
+        if page_hash is not None:
+            hashes.append(page_hash)
+    return hashes
 
 
 def _extract_from_archive(file_path: Path, num_pages: int) -> List:
@@ -186,6 +212,10 @@ def extract_sample_pages(file_path: PathLike, num_pages: int = 12) -> List:
         return []
 
     src = Path(file_path)
+
+    if is_image_folder(src):
+        return _extract_from_folder(src, num_pages)
+
     suffix = src.suffix.lower()
 
     if suffix in {".cbz", ".cbr", ".zip"}:
@@ -237,10 +267,24 @@ def _best_match_details(sig1: Sequence, sig2: Sequence) -> Tuple[float, float]:
     return avg_distance, good_ratio
 
 
+def _serialize_phash(page_hash) -> str:
+    return str(page_hash)
+
+
+def _deserialize_phash(value: str):
+    if imagehash is None:
+        return None
+    return imagehash.hex_to_hash(value)
+
+
 def find_perceptual_duplicates(
     file_paths: Iterable[PathLike],
     threshold: int = 10,
     page_tolerance: int = 5,
+    index: Optional["ComicIndex"] = None,
+    *,
+    use_cache: bool = True,
+    num_pages: int = DEFAULT_PERCEPTUAL_PAGES,
 ) -> List[List[Path]]:
     """Find perceptual duplicate groups across comic files."""
     paths = [Path(p) for p in file_paths]
@@ -250,14 +294,53 @@ def find_perceptual_duplicates(
     print(f"Computing page signatures for {len(paths)} file(s) ...")
     signatures: Dict[Path, List] = {}
     page_counts: Dict[Path, int] = {}
+    cache_hits = 0
 
-    for index, path in enumerate(paths, start=1):
-        print(f"  [{index}/{len(paths)}] sampling pages from {path.name}")
-        sig = compute_comic_signature(path)
+    for step, path in enumerate(paths, start=1):
+        sig: Optional[List] = None
+        record = index.get(path) if index is not None else None
+
+        if (
+            use_cache
+            and index is not None
+            and record
+            and record.perceptual_hashes
+            and record.perceptual_num_pages == num_pages
+            and index.is_content_cache_hit(path)
+        ):
+            sig = [
+                deserialized
+                for value in record.perceptual_hashes
+                if (deserialized := _deserialize_phash(value)) is not None
+            ]
+            if sig:
+                cache_hits += 1
+                print(f"  [{step}/{len(paths)}] cached signature {path.name}")
+                page_counts[path] = record.page_count
+                signatures[path] = sig
+                continue
+
+        print(f"  [{step}/{len(paths)}] sampling pages from {path.name}")
+        sig = compute_comic_signature(path, num_pages=num_pages)
+        meta = get_comic_metadata(path) or {}
+        page_count = int(meta.get("page_count") or 0)
+        page_counts[path] = page_count
+
         if sig:
             signatures[path] = sig
-        meta = get_comic_metadata(path) or {}
-        page_counts[path] = int(meta.get("page_count") or 0)
+            if index is not None:
+                index.upsert(
+                    path,
+                    content_fingerprint=compute_content_fingerprint(path),
+                    page_count=page_count,
+                    width=meta.get("width"),
+                    height=meta.get("height"),
+                    perceptual_hashes=[_serialize_phash(value) for value in sig],
+                    perceptual_num_pages=num_pages,
+                )
+
+    if cache_hits:
+        print(f"Reused perceptual cache for {cache_hits} comic(s).")
 
     if len(signatures) < 2:
         print("Not enough signatures to compare.")
