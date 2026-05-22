@@ -26,6 +26,10 @@ _BRACKET_PAIRS = {
 _METADATA_MARKERS = (
     "chinese",
     "english",
+    "chn",
+    "eng",
+    "cn",
+    "en",
     "digital",
     "complete",
     "ongoing",
