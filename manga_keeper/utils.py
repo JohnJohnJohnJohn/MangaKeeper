@@ -24,14 +24,46 @@ IMAGE_SUFFIXES = frozenset(
 )
 _IMAGE_SUFFIXES = IMAGE_SUFFIXES
 
+# Files created by macOS, Windows, or archive tools — not comic pages.
+_JUNK_FILENAMES = frozenset(
+    {
+        ".ds_store",
+        "desktop.ini",
+        "thumbs.db",
+        "ehthumbs.db",
+        "ehthumbs_vista.db",
+    }
+)
+
 
 def _natural_key(name: str) -> List:
     parts = re.split(r"(\d+)", name.lower())
     return [int(p) if p.isdigit() else p for p in parts]
 
 
+def is_junk_file(path: PathLike) -> bool:
+    """Return True for OS metadata files that should not be treated as comic pages."""
+    name = Path(path).name
+    if not name:
+        return True
+    if name.startswith("._"):
+        return True
+    if name.lower() in _JUNK_FILENAMES:
+        return True
+    normalized = Path(path).as_posix()
+    if "/__MACOSX/" in normalized or normalized.startswith("__MACOSX/"):
+        return True
+    return False
+
+
 def is_image_file(path: PathLike) -> bool:
     return Path(path).suffix.lower() in _IMAGE_SUFFIXES
+
+
+def is_comic_page_file(path: PathLike) -> bool:
+    """Return True for real page images, excluding OS metadata files."""
+    target = Path(path)
+    return target.is_file() and is_image_file(target) and not is_junk_file(target)
 
 
 def is_image_folder(path: PathLike) -> bool:
@@ -41,7 +73,7 @@ def is_image_folder(path: PathLike) -> bool:
         return False
     try:
         for entry in folder.iterdir():
-            if entry.is_file() and is_image_file(entry):
+            if is_comic_page_file(entry):
                 return True
     except OSError:
         return False
@@ -56,7 +88,7 @@ def list_folder_images(folder_path: PathLike) -> List[Path]:
     images = [
         entry.resolve()
         for entry in folder.iterdir()
-        if entry.is_file() and is_image_file(entry)
+        if is_comic_page_file(entry)
     ]
     return sorted(images, key=lambda p: _natural_key(p.name))
 
@@ -162,6 +194,11 @@ def format_size(num_bytes: float) -> str:
 
 
 def _is_image_member(name: str) -> bool:
+    if is_junk_file(Path(name).name):
+        return False
+    normalized = name.replace("\\", "/")
+    if "/__MACOSX/" in normalized or normalized.startswith("__MACOSX/"):
+        return False
     return Path(name).suffix.lower() in _IMAGE_SUFFIXES
 
 

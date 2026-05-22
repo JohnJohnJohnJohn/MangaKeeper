@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional, Union
 
-from .utils import is_image_file
+from .utils import is_comic_page_file
 
 if TYPE_CHECKING:
     from .index import ComicIndex
@@ -158,7 +158,7 @@ def scan_directory(
         ]
 
         has_direct_images = any(
-            entry.is_file() and is_image_file(entry) for entry in visible_entries
+            is_comic_page_file(entry) for entry in visible_entries
         )
 
         if has_direct_images:

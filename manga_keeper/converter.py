@@ -1,4 +1,4 @@
-"""Standardize comic folders and convert page images to size-budget PNG."""
+"""Standardize comic folders and convert page images to WebP."""
 
 from __future__ import annotations
 
@@ -10,8 +10,9 @@ import shutil
 import tempfile
 import zipfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 try:
     from PIL import Image
@@ -25,31 +26,44 @@ PathLike = Union[str, Path]
 
 log = logging.getLogger(__name__)
 
-TARGET_PAGE_EXTENSION = ".png"
+PAGE_EXTENSION = ".webp"
+DEFAULT_PAGE_QUALITY = 95
 
-# Converted PNG must not exceed this multiple of the source page file size.
 MAX_OUTPUT_SIZE_RATIO = 2.0
-# Prefer shrinking dimensions down to this scale before reducing color depth.
 MIN_OUTPUT_SCALE = 0.05
 _SCALE_REFINE_ITERATIONS = 5
-_QUANTIZE_COLOR_STEPS = (256, 128, 64, 32)
-_FAST_PNG_COMPRESS_LEVEL = 3
-
-# PNG compress_level only affects file size and encode time, not pixel fidelity.
-_PNG_COMPRESS_LARGE = 6
-_PNG_COMPRESS_MEDIUM = 7
-_PNG_COMPRESS_SMALL = 9
-_LARGE_PAGE_PIXELS = 4_000_000
-_MEDIUM_PAGE_PIXELS = 1_000_000
 
 _ARCHIVE_SUFFIXES = frozenset({".cbz", ".cbr", ".zip", ".pdf", ".epub"})
 
 
-def needs_png_conversion(comic_path: PathLike) -> bool:
+@dataclass(frozen=True)
+class ConversionSettings:
+    page_quality: int = DEFAULT_PAGE_QUALITY
+    max_page_size_mb: float = 0.0
+
+    def extension(self) -> str:
+        return PAGE_EXTENSION
+
+    def uses_size_budget(self) -> bool:
+        return self.max_page_size_mb > 0
+
+
+DEFAULT_CONVERSION_SETTINGS = ConversionSettings()
+
+
+def default_worker_count() -> int:
+    return max(1, os.cpu_count() or 4)
+
+
+def needs_page_conversion(
+    comic_path: PathLike,
+    settings: ConversionSettings = DEFAULT_CONVERSION_SETTINGS,
+) -> bool:
+    del settings
     path = Path(comic_path)
     if is_image_folder(path):
         return any(
-            image.suffix.lower() != TARGET_PAGE_EXTENSION
+            image.suffix.lower() != PAGE_EXTENSION
             for image in list_folder_images(path)
         )
     if path.is_file():
@@ -62,25 +76,17 @@ def needs_folder_rename(comic_path: PathLike) -> bool:
     return is_image_folder(path) and not folder_name_is_standard(path)
 
 
-def needs_conversion(comic_path: PathLike) -> bool:
+def needs_conversion(
+    comic_path: PathLike,
+    settings: ConversionSettings = DEFAULT_CONVERSION_SETTINGS,
+) -> bool:
     path = Path(comic_path)
     if is_image_folder(path):
-        return needs_folder_rename(path) or needs_png_conversion(path)
-    return needs_png_conversion(path)
+        return needs_folder_rename(path) or needs_page_conversion(path, settings)
+    return needs_page_conversion(path, settings)
 
 
-def _png_compress_level(width: int, height: int) -> int:
-    """Pick PNG zlib level from page size (quality is unchanged at any level)."""
-    pixels = width * height
-    if pixels >= _LARGE_PAGE_PIXELS:
-        return _PNG_COMPRESS_LARGE
-    if pixels >= _MEDIUM_PAGE_PIXELS:
-        return _PNG_COMPRESS_MEDIUM
-    return _PNG_COMPRESS_SMALL
-
-
-def _prepare_png_image(img: Image.Image) -> Image.Image:
-    """Convert to a PNG-safe mode without unnecessary resampling."""
+def _prepare_image(img: Image.Image) -> Image.Image:
     if img.mode in ("RGBA", "LA"):
         return img
     if img.mode == "P" and "transparency" in img.info:
@@ -109,36 +115,13 @@ def _scaled_image(img: Image.Image, scale: float) -> Image.Image:
     return img.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
 
-def _quantize_image(img: Image.Image, colors: int) -> Image.Image:
-    if img.mode == "RGBA":
-        rgb = img.convert("RGB")
-        quantized = rgb.quantize(colors=colors, method=Image.Quantize.MEDIANCUT)
-        result = quantized.convert("RGBA")
-        result.putalpha(img.getchannel("A"))
-        return result
-    working = img.convert("RGB") if img.mode != "RGB" else img
-    return working.quantize(colors=colors, method=Image.Quantize.MEDIANCUT).convert("RGB")
-
-
-def _encode_png_bytes(
-    img: Image.Image,
-    *,
-    colors: Optional[int] = None,
-    fast: bool = False,
-) -> bytes:
+def _encode_webp_bytes(img: Image.Image, settings: ConversionSettings) -> bytes:
     buffer = io.BytesIO()
-    to_save = _quantize_image(img, colors) if colors is not None else img
-    if fast:
-        compress_level = _FAST_PNG_COMPRESS_LEVEL
-        optimize = False
-    else:
-        compress_level = _png_compress_level(to_save.width, to_save.height)
-        optimize = True
-    to_save.save(
+    img.save(
         buffer,
-        format="PNG",
-        compress_level=compress_level,
-        optimize=optimize,
+        format="WEBP",
+        quality=settings.page_quality,
+        method=6,
     )
     return buffer.getvalue()
 
@@ -154,11 +137,12 @@ def _refine_scale_with_budget(
     img: Image.Image,
     max_bytes: int,
     initial_scale: float,
+    encode_fn: Callable[[Image.Image], bytes],
 ) -> Tuple[float, bytes]:
     low = MIN_OUTPUT_SCALE
     high = initial_scale
     best_scale = MIN_OUTPUT_SCALE
-    best_data = _encode_png_bytes(_scaled_image(img, MIN_OUTPUT_SCALE), fast=True)
+    best_data = encode_fn(_scaled_image(img, MIN_OUTPUT_SCALE))
 
     if len(best_data) > max_bytes:
         return MIN_OUTPUT_SCALE, best_data
@@ -166,7 +150,7 @@ def _refine_scale_with_budget(
     for _ in range(_SCALE_REFINE_ITERATIONS):
         scale = (low + high) / 2
         candidate = _scaled_image(img, scale)
-        data = _encode_png_bytes(candidate, fast=True)
+        data = encode_fn(candidate)
         if len(data) <= max_bytes:
             best_scale = scale
             best_data = data
@@ -177,22 +161,22 @@ def _refine_scale_with_budget(
     return best_scale, best_data
 
 
-def _fit_png_within_budget(
+def _fit_image_within_budget(
     img: Image.Image,
     max_bytes: int,
+    encode_fn: Callable[[Image.Image], bytes],
     *,
     source_label: str,
-) -> Tuple[bytes, float, Optional[int]]:
-    """Return PNG bytes within ``max_bytes``, preferring resize over color reduction."""
-    full_size = _encode_png_bytes(img)
+) -> bytes:
+    full_size = encode_fn(img)
     if len(full_size) <= max_bytes:
-        return full_size, 1.0, None
+        return full_size
 
-    probe_size = _encode_png_bytes(img, fast=True)
-    estimated_scale = _estimate_scale_for_budget(len(probe_size), max_bytes)
-    best_scale, _ = _refine_scale_with_budget(img, max_bytes, estimated_scale)
+    probe = encode_fn(img)
+    estimated_scale = _estimate_scale_for_budget(len(probe), max_bytes)
+    best_scale, _ = _refine_scale_with_budget(img, max_bytes, estimated_scale, encode_fn)
 
-    final = _encode_png_bytes(_scaled_image(img, best_scale))
+    final = encode_fn(_scaled_image(img, best_scale))
     if len(final) <= max_bytes:
         if best_scale < 0.999:
             fitted = _scaled_image(img, best_scale)
@@ -203,32 +187,19 @@ def _fit_png_within_budget(
                 fitted.width,
                 fitted.height,
             )
-        return final, best_scale, None
+        return final
 
     smaller_scale = max(MIN_OUTPUT_SCALE, best_scale * 0.9)
-    final = _encode_png_bytes(_scaled_image(img, smaller_scale))
+    final = encode_fn(_scaled_image(img, smaller_scale))
     if len(final) <= max_bytes:
-        return final, smaller_scale, None
-
-    smallest = _scaled_image(img, MIN_OUTPUT_SCALE)
-    for colors in _QUANTIZE_COLOR_STEPS:
-        data = _encode_png_bytes(smallest, colors=colors)
-        if len(data) <= max_bytes:
-            log.warning(
-                "Reduced colors to %s for %s after resize (%.0f%%) to meet size budget",
-                colors,
-                source_label,
-                MIN_OUTPUT_SCALE * 100,
-            )
-            return data, MIN_OUTPUT_SCALE, colors
+        return final
 
     raise ValueError(
-        f"Could not fit {source_label} within {max_bytes} bytes "
-        f"using resize-first heuristics"
+        f"Could not fit {source_label} within {max_bytes} bytes using resize-first heuristics"
     )
 
 
-def _max_output_bytes(source: Path, max_page_size_mb: Optional[float] = None) -> int:
+def _max_output_bytes(source: Path, settings: ConversionSettings) -> int:
     try:
         original_size = source.stat().st_size
     except OSError:
@@ -237,53 +208,43 @@ def _max_output_bytes(source: Path, max_page_size_mb: Optional[float] = None) ->
     budgets: List[int] = []
     if original_size > 0:
         budgets.append(max(int(original_size * MAX_OUTPUT_SIZE_RATIO), 1024))
-    if max_page_size_mb is not None and max_page_size_mb > 0:
-        budgets.append(max(int(max_page_size_mb * 1024 * 1024), 1024))
+    if settings.max_page_size_mb > 0:
+        budgets.append(max(int(settings.max_page_size_mb * 1024 * 1024), 1024))
 
     if not budgets:
         return 512 * 1024
     return min(budgets)
 
 
-def _save_image_as_png(
+def _save_page_image(
     source: Path,
     destination: Path,
-    *,
-    max_page_size_mb: Optional[float] = None,
+    settings: ConversionSettings,
 ) -> bool:
     if Image is None:
-        log.error("Pillow not installed; cannot write PNG")
+        log.error("Pillow not installed; cannot convert images")
         return False
+
     try:
-        max_bytes = _max_output_bytes(source, max_page_size_mb)
         with Image.open(source) as img:
-            prepared = _prepare_png_image(img)
-            png_bytes, scale, colors = _fit_png_within_budget(
-                prepared,
-                max_bytes,
-                source_label=source.name,
-            )
+            prepared = _prepare_image(img)
+            encode_fn = lambda image: _encode_webp_bytes(image, settings)
+            if settings.uses_size_budget():
+                max_bytes = _max_output_bytes(source, settings)
+                output_bytes = _fit_image_within_budget(
+                    prepared,
+                    max_bytes,
+                    encode_fn,
+                    source_label=source.name,
+                )
+            else:
+                output_bytes = encode_fn(prepared)
+
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(png_bytes)
-        output_size = destination.stat().st_size
-        if output_size > max_bytes:
-            raise ValueError(
-                f"Converted PNG {destination.name} is {output_size} bytes, "
-                f"over budget of {max_bytes} bytes"
-            )
-        if scale < 0.999 or colors is not None:
-            log.debug(
-                "Converted %s -> %s (%d -> %d bytes, scale=%.2f, colors=%s)",
-                source.name,
-                destination.name,
-                source.stat().st_size,
-                output_size,
-                scale,
-                colors,
-            )
-        return output_size > 0
+        destination.write_bytes(output_bytes)
+        return destination.stat().st_size > 0
     except (OSError, ValueError) as exc:
-        log.error("Failed converting %s to PNG: %s", source, exc)
+        log.error("Failed converting %s to WebP: %s", source, exc)
         return False
 
 
@@ -311,26 +272,23 @@ def _unique_output_dir(parent: Path, folder_name: str) -> Path:
     return output
 
 
-def _conversion_destination(image: Path) -> Path:
-    destination = image.with_suffix(TARGET_PAGE_EXTENSION)
+def _conversion_destination(image: Path, settings: ConversionSettings) -> Path:
+    destination = image.with_suffix(settings.extension())
     if destination.exists() and destination.resolve() != image.resolve():
         destination = _unique_path(image.parent, destination.name)
     return destination
 
 
 def _convert_page_task(
-    args: Tuple[str, str, Optional[float]],
+    args: Tuple[str, str, int, float],
 ) -> Tuple[str, bool, Optional[str]]:
-    """Worker entry point for parallel page conversion."""
-    source_str, destination_str, max_page_size_mb = args
-    source = Path(source_str)
-    destination = Path(destination_str)
+    source_str, destination_str, page_quality, max_page_size_mb = args
+    settings = ConversionSettings(
+        page_quality=page_quality,
+        max_page_size_mb=max_page_size_mb,
+    )
     try:
-        ok = _save_image_as_png(
-            source,
-            destination,
-            max_page_size_mb=max_page_size_mb,
-        )
+        ok = _save_page_image(Path(source_str), Path(destination_str), settings)
         if not ok:
             return source_str, False, "conversion failed"
         return source_str, True, None
@@ -338,28 +296,19 @@ def _convert_page_task(
         return source_str, False, str(exc)
 
 
-def default_worker_count() -> int:
-    return max(1, os.cpu_count() or 4)
-
-
-def _convert_image_to_png(
+def _convert_image_page(
     image: Path,
+    settings: ConversionSettings,
     *,
     trash_dir: Optional[Path] = None,
     library_root: Optional[Path] = None,
     keep_original: bool = False,
-    max_page_size_mb: Optional[float] = None,
 ) -> Optional[Path]:
-    if image.suffix.lower() == TARGET_PAGE_EXTENSION:
+    if image.suffix.lower() == settings.extension():
         return image
 
-    destination = _conversion_destination(image)
-
-    if not _save_image_as_png(
-        image,
-        destination,
-        max_page_size_mb=max_page_size_mb,
-    ):
+    destination = _conversion_destination(image, settings)
+    if not _save_page_image(image, destination, settings):
         return None
 
     if image.resolve() != destination.resolve() and not keep_original:
@@ -384,19 +333,20 @@ def _convert_image_to_png(
     return destination
 
 
-def _convert_folder_images_to_png(
+def _convert_folder_images(
     folder: Path,
+    settings: ConversionSettings,
     *,
     trash_dir: Optional[Path] = None,
     library_root: Optional[Path] = None,
     keep_originals: bool = False,
-    max_page_size_mb: Optional[float] = None,
     workers: int = 1,
 ) -> bool:
+    target_ext = settings.extension()
     images = [
         image
         for image in list_folder_images(folder)
-        if image.suffix.lower() != TARGET_PAGE_EXTENSION
+        if image.suffix.lower() != target_ext
     ]
     if not images:
         return True
@@ -404,12 +354,12 @@ def _convert_folder_images_to_png(
     if workers <= 1:
         for image in images:
             if (
-                _convert_image_to_png(
+                _convert_image_page(
                     image,
+                    settings,
                     trash_dir=trash_dir,
                     library_root=library_root,
                     keep_original=keep_originals,
-                    max_page_size_mb=max_page_size_mb,
                 )
                 is None
             ):
@@ -419,8 +369,9 @@ def _convert_folder_images_to_png(
     tasks = [
         (
             str(image.resolve()),
-            str(_conversion_destination(image).resolve()),
-            max_page_size_mb,
+            str(_conversion_destination(image, settings).resolve()),
+            settings.page_quality,
+            settings.max_page_size_mb,
         )
         for image in images
     ]
@@ -472,8 +423,7 @@ def _rename_folder_to_standard(folder: Path) -> Path:
 def _extract_archive_to_folder(
     archive_path: Path,
     output_dir: Path,
-    *,
-    max_page_size_mb: Optional[float] = None,
+    settings: ConversionSettings,
 ) -> List[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     suffix = archive_path.suffix.lower()
@@ -494,14 +444,11 @@ def _extract_archive_to_folder(
                         for name in names:
                             temp_file = temp_root / Path(name).name
                             temp_file.write_bytes(archive.read(name))
-                            png_path = _convert_image_to_png(
-                                temp_file,
-                                max_page_size_mb=max_page_size_mb,
-                            )
-                            if png_path is None:
+                            converted = _convert_image_page(temp_file, settings)
+                            if converted is None:
                                 return []
-                            final_path = _unique_path(output_dir, png_path.name)
-                            shutil.move(str(png_path), str(final_path))
+                            final_path = _unique_path(output_dir, converted.name)
+                            shutil.move(str(converted), str(final_path))
                             written.append(final_path)
                 except (rarfile.Error, OSError) as exc:
                     log.error("Failed extracting CBR %s: %s", archive_path, exc)
@@ -512,14 +459,11 @@ def _extract_archive_to_folder(
                         for name in names:
                             temp_file = temp_root / Path(name).name
                             temp_file.write_bytes(archive.read(name))
-                            png_path = _convert_image_to_png(
-                                temp_file,
-                                max_page_size_mb=max_page_size_mb,
-                            )
-                            if png_path is None:
+                            converted = _convert_image_page(temp_file, settings)
+                            if converted is None:
                                 return []
-                            final_path = _unique_path(output_dir, png_path.name)
-                            shutil.move(str(png_path), str(final_path))
+                            final_path = _unique_path(output_dir, converted.name)
+                            shutil.move(str(converted), str(final_path))
                             written.append(final_path)
                 except (zipfile.BadZipFile, OSError) as exc:
                     log.error("Failed extracting archive %s: %s", archive_path, exc)
@@ -543,8 +487,11 @@ def _extract_archive_to_folder(
                     pix = page.get_pixmap()
                     temp_file = temp_root / f"page_{index + 1}.png"
                     pix.save(str(temp_file))
-                    final_path = _unique_path(output_dir, temp_file.name)
-                    shutil.move(str(temp_file), str(final_path))
+                    converted = _convert_image_page(temp_file, settings)
+                    if converted is None:
+                        return []
+                    final_path = _unique_path(output_dir, converted.name)
+                    shutil.move(str(converted), str(final_path))
                     written.append(final_path)
             finally:
                 doc.close()
@@ -557,20 +504,20 @@ def _extract_archive_to_folder(
 
 def _standardize_image_folder(
     folder: Path,
+    settings: ConversionSettings,
     *,
     trash_dir: Optional[Path] = None,
     library_root: Optional[Path] = None,
     keep_originals: bool = False,
-    max_page_size_mb: Optional[float] = None,
     workers: int = 1,
 ) -> Optional[Path]:
-    if needs_png_conversion(folder):
-        if not _convert_folder_images_to_png(
+    if needs_page_conversion(folder, settings):
+        if not _convert_folder_images(
             folder,
+            settings,
             trash_dir=trash_dir,
             library_root=library_root,
             keep_originals=keep_originals,
-            max_page_size_mb=max_page_size_mb,
             workers=workers,
         ):
             return None
@@ -578,7 +525,6 @@ def _standardize_image_folder(
 
 
 def rename_comic_folder_if_needed(folder: PathLike) -> Path:
-    """Rename an image folder to the standard convention without prompting."""
     path = Path(folder)
     if not is_image_folder(path):
         return path
@@ -592,10 +538,17 @@ def standardize_comic(
     trash_dir: Optional[PathLike] = None,
     library_root: Optional[PathLike] = None,
     keep_originals: bool = False,
-    max_page_size_mb: Optional[float] = None,
+    settings: ConversionSettings = DEFAULT_CONVERSION_SETTINGS,
     workers: int = 1,
+    max_page_size_mb: Optional[float] = None,
 ) -> Optional[Path]:
-    """Convert page images to size-budget PNG and rename comic folders to the standard convention."""
+    """Convert page images to WebP and rename comic folders to the standard convention."""
+    if max_page_size_mb is not None:
+        settings = ConversionSettings(
+            page_quality=settings.page_quality,
+            max_page_size_mb=max_page_size_mb,
+        )
+
     src = Path(input_path)
     trash_path = Path(trash_dir) if trash_dir is not None else None
     library_path = Path(library_root).resolve() if library_root is not None else None
@@ -610,16 +563,16 @@ def standardize_comic(
         log.warning("Cannot standardize invalid path: %s", src)
         return None
 
-    if not needs_conversion(src):
+    if not needs_conversion(src, settings):
         return src
 
     if is_image_folder(src):
         return _standardize_image_folder(
             src,
+            settings,
             trash_dir=trash_path,
             library_root=library_path,
             keep_originals=keep_originals,
-            max_page_size_mb=max_page_size_mb,
             workers=workers,
         )
 
@@ -627,11 +580,7 @@ def standardize_comic(
     output = _unique_output_dir(parent, standard_folder_name(src))
     output.mkdir(parents=True, exist_ok=True)
 
-    written = _extract_archive_to_folder(
-        src,
-        output,
-        max_page_size_mb=max_page_size_mb,
-    )
+    written = _extract_archive_to_folder(src, output, settings)
     if not written:
         shutil.rmtree(output, ignore_errors=True)
         return None
@@ -644,8 +593,9 @@ def standardize_comic_with_cleanup(
     keep_originals: bool = False,
     trash_dir: Optional[PathLike] = None,
     library_root: Optional[PathLike] = None,
-    max_page_size_mb: Optional[float] = None,
+    settings: ConversionSettings = DEFAULT_CONVERSION_SETTINGS,
     workers: int = 1,
+    max_page_size_mb: Optional[float] = None,
 ) -> Optional[Path]:
     src = Path(input_path)
     if not src.exists():
@@ -656,8 +606,9 @@ def standardize_comic_with_cleanup(
         keep_originals=keep_originals,
         trash_dir=trash_dir,
         library_root=library_root,
-        max_page_size_mb=max_page_size_mb,
+        settings=settings,
         workers=workers,
+        max_page_size_mb=max_page_size_mb,
     )
     if output is None:
         return None
@@ -667,8 +618,3 @@ def standardize_comic_with_cleanup(
 
     move_to_trash(src, trash_dir=trash_dir, library_root=library_root)
     return output
-
-
-# Backwards-compatible aliases used by older imports.
-normalize_comic_to_png = standardize_comic
-normalize_comic_to_png_with_cleanup = standardize_comic_with_cleanup

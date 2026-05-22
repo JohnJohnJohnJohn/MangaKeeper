@@ -22,6 +22,7 @@ from manga_keeper.hasher import find_exact_duplicates, select_file_to_keep
 from manga_keeper.perceptual import find_perceptual_duplicates
 from manga_keeper.resolver import get_quality_score
 from manga_keeper.converter import (
+    ConversionSettings,
     default_worker_count,
     needs_conversion,
     standardize_comic,
@@ -156,7 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="manga-keeper",
         description=(
             "Scan a directory of manga/comics, deduplicate them (exact + perceptual), "
-            "and normalize pages to size-budget PNG."
+            "and standardize page formats and folder names."
         ),
     )
     parser.add_argument(
@@ -178,17 +179,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--keep-originals",
         action="store_true",
-        help="Keep the original files after PNG normalization (do not move to trash).",
+        help="Keep the original files after page conversion (do not move to trash).",
+    )
+    parser.add_argument(
+        "--page-quality",
+        type=int,
+        default=95,
+        help="WebP quality for phase 4 page conversion (1-100). Default: 95.",
     )
     parser.add_argument(
         "--max-page-size-mb",
         type=float,
-        default=2.0,
+        default=0.0,
         metavar="MB",
         help=(
-            "Maximum output PNG size per page in megabytes during phase 4. "
-            "The converter uses the stricter of this limit and 2x the source page size. "
-            "Default: 2."
+            "Optional per-page WebP size cap. 0 disables size limits. "
+            "When set, pages may be downscaled to fit."
         ),
     )
     parser.add_argument(
@@ -223,7 +229,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--standardize-only",
         action="store_true",
-        help="Scan the library and run folder/PNG standardization (phase 4) only.",
+        help="Scan the library and run page/folder standardization (phase 4) only.",
     )
     parser.add_argument(
         "--skip-combine-episodes",
@@ -463,7 +469,7 @@ def _phase_conversion(
     comic_index: Optional[ComicIndex] = None,
     *,
     library_root: Optional[Path] = None,
-    max_page_size_mb: float = 2.0,
+    conversion_settings: ConversionSettings,
     workers: int = 1,
 ) -> tuple[int, int]:
     _header("Phase 4: Standardizing Comics")
@@ -471,7 +477,7 @@ def _phase_conversion(
     candidates: List[Path] = []
     for path in files:
         try:
-            if needs_conversion(path):
+            if needs_conversion(path, conversion_settings):
                 candidates.append(path)
         except Exception as exc:
             log.error("needs_conversion failed for %s: %s", path, exc)
@@ -480,11 +486,16 @@ def _phase_conversion(
         _ok("Every remaining comic already matches the standard folder convention.")
         return 0, 0
 
+    budget_note = (
+        f", max {conversion_settings.max_page_size_mb:g} MB/page"
+        if conversion_settings.uses_size_budget()
+        else ""
+    )
     print(
         _color(
             f"Automatically standardizing {len(candidates)} comic(s) "
-            f"(folder rename + PNG pages; max {max_page_size_mb:g} MB/page; "
-            f"{workers} worker(s); no prompts) ...",
+            f"(folder rename + WebP pages at quality {conversion_settings.page_quality}"
+            f"{budget_note}; {workers} worker(s); no prompts) ...",
             "bold",
         )
     )
@@ -505,7 +516,7 @@ def _phase_conversion(
                     trash_dir=trash_dir,
                     library_root=library_root,
                     keep_originals=keep_originals,
-                    max_page_size_mb=max_page_size_mb,
+                    settings=conversion_settings,
                     workers=workers,
                 )
             else:
@@ -514,7 +525,7 @@ def _phase_conversion(
                     keep_originals=keep_originals,
                     trash_dir=trash_dir,
                     library_root=library_root,
-                    max_page_size_mb=max_page_size_mb,
+                    settings=conversion_settings,
                     workers=workers,
                 )
         except Exception as exc:
@@ -793,13 +804,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not root.is_dir():
         _err(f"Path is not a directory: {root}")
         return 2
-    if args.max_page_size_mb <= 0:
-        _err("--max-page-size-mb must be greater than 0.")
+    if args.max_page_size_mb < 0:
+        _err("--max-page-size-mb must be 0 or greater.")
+        return 2
+    if not 1 <= args.page_quality <= 100:
+        _err("--page-quality must be between 1 and 100.")
         return 2
     workers = args.workers if args.workers > 0 else default_worker_count()
     if workers < 1:
         _err("--workers must be at least 1.")
         return 2
+    conversion_settings = ConversionSettings(
+        page_quality=args.page_quality,
+        max_page_size_mb=args.max_page_size_mb,
+    )
 
     trash_dir = root / ".manga_keeper_trash"
     index_path = index_file_for(root)
@@ -813,7 +831,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"  threshold: {args.threshold}")
     print(f"  dry-run:   {args.dry_run}")
     print(f"  keep-originals: {args.keep_originals}")
-    print(f"  max-page-size: {args.max_page_size_mb:g} MB")
+    print(f"  page-quality: {conversion_settings.page_quality}")
+    if conversion_settings.uses_size_budget():
+        print(f"  max-page-size: {conversion_settings.max_page_size_mb:g} MB")
     print(f"  workers:   {workers}")
     print(f"  cache:     {'rebuild' if not use_cache else f'{len(index)} record(s)'}")
     if args.suggest_artists or args.artists_only:
@@ -863,7 +883,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 log,
                 comic_index=index,
                 library_root=root,
-                max_page_size_mb=args.max_page_size_mb,
+                conversion_settings=conversion_settings,
                 workers=workers,
             )
             if run_combine_episodes:
@@ -905,7 +925,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 log,
                 comic_index=index,
                 library_root=root,
-                max_page_size_mb=args.max_page_size_mb,
+                conversion_settings=conversion_settings,
                 workers=workers,
             )
 

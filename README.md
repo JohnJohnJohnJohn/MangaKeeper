@@ -7,7 +7,7 @@ A Python CLI tool to organize manga and comic collections by removing duplicates
 - **Exact duplicate detection** via SHA256 — files with identical content are identified and deduplicated
 - **Perceptual duplicate detection** via page hashing — different scans or encodes of the same title are detected using perceptual image hashing on sampled pages
 - **Quality-based selection** — when duplicates are found, the best version (page count, resolution, file size) is kept automatically
-- **PNG pages + folder naming** — page images are converted to PNG with a size budget (at most 2× the original page file, preferring resize over quality loss), keeping their original filenames; comic folders are renamed to a cleaned standard convention
+- **Standardized WebP pages + folder naming** — page images are converted to WebP (default quality 95, full resolution), keeping their original filenames; comic folders are renamed to a cleaned standard convention
 
 ## Prerequisites
 
@@ -53,7 +53,9 @@ MangaKeeper processes your collection in six phases (episode combining runs by d
 
 3. **Perceptual Dedup** — Samples pages from each archive and computes perceptual hashes. Files with similar page signatures (below the threshold) are grouped as duplicates of the same title. The highest-quality version is kept.
 
-4. **Standardize** — Converts page images to PNG (original filenames preserved) using a per-page size budget. Each PNG must be no larger than the stricter of **2× the source page file** or **`--max-page-size-mb`** (default: 2 MB). When a straight PNG conversion would exceed that budget, MangaKeeper shrinks the page first and only reduces color depth as a last resort. Folder names are cleaned to a standard convention: bracket variants normalized to ASCII `[]` / `()`, no double spaces, spaces around bracket groups, duplicate markers removed. Archives are extracted into a standardized folder. Converted page originals are moved to trash by default.
+4. **Standardize** — Converts page images to **WebP** (original filenames preserved, default quality 95, full resolution). Folder names are cleaned to a standard convention: bracket variants normalized to ASCII `[]` / `()`, no double spaces, spaces around bracket groups, duplicate markers removed. Archives are extracted into a standardized folder. Converted page originals are moved to trash by default.
+
+   Use `--page-quality` to adjust WebP quality (1–100). Use `--max-page-size-mb` to optionally cap per-page file size; when set, pages may be downscaled to fit.
 
 5. **Combine episodes** — Detects contiguous episode folders (for example `manga_a_episode_1` + `manga_a_episode_2`) and merges them into a single folder such as `manga_a_episode_1to2`. Pages are prefixed by episode (`e01_001.webp`, `e02_001.webp`, …) to avoid filename collisions. Non-contiguous gaps (for example episodes 1 and 3 without 2) are skipped. Prompts per group; Enter accepts the default. Use `--skip-combine-episodes` to skip this phase.
 
@@ -97,7 +99,7 @@ Unchanged comics skip re-listing their page files during scan and skip re-hashin
 
 ## Safety Features
 
-- **Confirmation prompts** — Phases 2, 3, and 5 ask before removing or merging (Enter accepts the default). Phase 3 lets you pick which version to keep, with page counts shown for each copy. Phase 4 automatically renames folders and converts pages to PNG without prompting.
+- **Confirmation prompts** — Phases 2, 3, and 5 ask before removing or merging (Enter accepts the default). Phase 3 lets you pick which version to keep, with page counts shown for each copy. Phase 4 automatically renames folders and converts pages without prompting.
 - **Trash instead of delete** — Removed duplicates, merged episode folders, converted page originals, and extracted archives are moved to `.manga_keeper_trash/` preserving their library-relative folder structure
 - **Dry-run mode** — Preview all actions without making any changes to your files
 
@@ -107,15 +109,16 @@ Unchanged comics skip re-listing their page files during scan and skip re-hashin
 |---|---|---|
 | `--path` | Path to the directory containing comic files | Required |
 | `--dry-run` | Preview changes without modifying any files | `False` |
-| `--keep-originals` | Keep original page files and archives after PNG normalization | `False` |
-| `--max-page-size-mb` | Maximum output PNG size per page in megabytes (also capped at 2× source size) | `2` |
+| `--keep-originals` | Keep original page files and archives after page conversion | `False` |
+| `--page-quality` | WebP quality for phase 4 page conversion (1–100) | `95` |
+| `--max-page-size-mb` | Optional per-page WebP size cap; `0` disables downscaling | `0` |
 | `--workers` | Parallel workers for phase 4 page conversion | CPU core count |
 | `--threshold` | Perceptual hash distance threshold for duplicate detection | `10` |
 | `--log-file` | Path to write a detailed operation log | None |
 | `--rebuild-cache` | Ignore and rebuild the local scan/hash index | `False` |
 | `--suggest-artists` | Suggest artist tags for untagged comics after the normal pipeline | `False` |
 | `--artists-only` | Scan and run artist suggestions only | `False` |
-| `--standardize-only` | Scan and run folder/PNG standardization (phase 4) only | `False` |
+| `--standardize-only` | Scan and run folder/page standardization (phase 4) only | `False` |
 | `--skip-combine-episodes` | Skip merging contiguous episode folders (phase 5) | `False` |
 | `--combine-episodes-only` | Scan and merge contiguous episode folders only | `False` |
 | `--artist-min-samples` | Minimum tagged works required to learn an artist profile | `3` |
