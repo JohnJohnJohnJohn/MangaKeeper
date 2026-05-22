@@ -67,7 +67,7 @@ Unchanged comics skip re-listing their page files during scan and skip re-hashin
 
 ## Safety Features
 
-- **Confirmation prompts** — Phases 2 and 3 ask before removing duplicates (Enter accepts the default). Phase 3 lets you pick which version to keep, with page counts shown for each copy. Phase 4 standardizes folders and PNG pages automatically.
+- **Confirmation prompts** — Phases 2 and 3 ask before removing duplicates (Enter accepts the default). Phase 3 lets you pick which version to keep, with page counts shown for each copy. Phase 4 automatically renames folders and converts pages to PNG without prompting.
 - **Trash instead of delete** — Removed files are moved to `.manga_keeper_trash/` rather than permanently deleted
 - **Dry-run mode** — Preview all actions without making any changes to your files
 

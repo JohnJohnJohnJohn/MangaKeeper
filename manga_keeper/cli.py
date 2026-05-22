@@ -13,7 +13,14 @@ from manga_keeper.scanner import scan_directory
 from manga_keeper.hasher import find_exact_duplicates, select_file_to_keep
 from manga_keeper.perceptual import find_perceptual_duplicates
 from manga_keeper.resolver import get_quality_score
-from manga_keeper.converter import needs_conversion, standardize_comic_with_cleanup
+from manga_keeper.naming import standard_folder_name
+from manga_keeper.converter import (
+    needs_conversion,
+    needs_folder_rename,
+    needs_png_conversion,
+    standardize_comic,
+    standardize_comic_with_cleanup,
+)
 from manga_keeper.utils import (
     setup_logging,
     move_to_trash,
@@ -386,32 +393,43 @@ def _phase_conversion(
 
     print(
         _color(
-            f"Standardizing {len(candidates)} comic(s) "
-            f"(folder rename + lossless PNG pages) ...",
+            f"Automatically standardizing {len(candidates)} comic(s) "
+            f"(folder rename + PNG pages; no prompts) ...",
             "bold",
         )
     )
 
-    converted = 0
+    changed = 0
     bytes_delta = 0
 
     for step, path in enumerate(candidates, start=1):
+        actions: List[str] = []
+        if needs_folder_rename(path):
+            actions.append(f"rename -> {standard_folder_name(path)}")
+        if needs_png_conversion(path):
+            actions.append("convert pages to PNG")
+
         print()
         print(_color(f"[{step}/{len(candidates)}]", "bold") + f" {path}")
+        if actions:
+            print(f"  {_color('actions', 'magenta')}: {', '.join(actions)}")
 
         if dry_run:
-            _warn("  Dry run: would normalize this comic.")
+            _warn("  Dry run: would apply automatically.")
             continue
 
         pre_size = _safe_size(path)
         try:
-            output = standardize_comic_with_cleanup(
-                path,
-                keep_originals=keep_originals,
-                trash_dir=trash_dir,
-            )
+            if is_image_folder(path):
+                output = standardize_comic(path)
+            else:
+                output = standardize_comic_with_cleanup(
+                    path,
+                    keep_originals=keep_originals,
+                    trash_dir=trash_dir,
+                )
         except Exception as exc:
-            log.error("Normalization failed for %s: %s", path, exc)
+            log.error("Standardization failed for %s: %s", path, exc)
             _err(f"  Failed to standardize {path.name}")
             continue
 
@@ -419,7 +437,7 @@ def _phase_conversion(
             _err(f"  Failed to standardize {path.name}")
             continue
 
-        converted += 1
+        changed += 1
         bytes_delta += pre_size - _safe_size(output)
         _ok(f"  Standardized -> {output}")
         if comic_index is not None:
@@ -428,16 +446,16 @@ def _phase_conversion(
 
     if dry_run:
         _warn("Dry run: no standardizations performed.")
-    elif converted:
+    elif changed:
         _ok(
-            f"Standardized {converted} comic(s); net size change: "
+            f"Standardized {changed} comic(s) automatically; net size change: "
             f"{format_size(bytes_delta)} "
             f"{'saved' if bytes_delta >= 0 else 'grew'}."
         )
     else:
         _warn("No comics were standardized.")
 
-    return converted, bytes_delta
+    return changed, bytes_delta
 
 
 def main(argv: Optional[List[str]] = None) -> int:

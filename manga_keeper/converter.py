@@ -26,11 +26,9 @@ TARGET_PAGE_EXTENSION = ".png"
 _ARCHIVE_SUFFIXES = frozenset({".cbz", ".cbr", ".zip", ".pdf", ".epub"})
 
 
-def needs_conversion(comic_path: PathLike) -> bool:
+def needs_png_conversion(comic_path: PathLike) -> bool:
     path = Path(comic_path)
     if is_image_folder(path):
-        if not folder_name_is_standard(path):
-            return True
         return any(
             image.suffix.lower() != TARGET_PAGE_EXTENSION
             for image in list_folder_images(path)
@@ -38,6 +36,18 @@ def needs_conversion(comic_path: PathLike) -> bool:
     if path.is_file():
         return path.suffix.lower() in _ARCHIVE_SUFFIXES
     return False
+
+
+def needs_folder_rename(comic_path: PathLike) -> bool:
+    path = Path(comic_path)
+    return is_image_folder(path) and not folder_name_is_standard(path)
+
+
+def needs_conversion(comic_path: PathLike) -> bool:
+    path = Path(comic_path)
+    if is_image_folder(path):
+        return needs_folder_rename(path) or needs_png_conversion(path)
+    return needs_png_conversion(path)
 
 
 def _save_image_as_png(source: Path, destination: Path) -> bool:
@@ -204,9 +214,18 @@ def _extract_archive_to_folder(archive_path: Path, output_dir: Path) -> List[Pat
 
 
 def _standardize_image_folder(folder: Path) -> Optional[Path]:
-    if not _convert_folder_images_to_png(folder):
-        return None
+    if needs_png_conversion(folder):
+        if not _convert_folder_images_to_png(folder):
+            return None
     return _rename_folder_to_standard(folder)
+
+
+def rename_comic_folder_if_needed(folder: PathLike) -> Path:
+    """Rename an image folder to the standard convention without prompting."""
+    path = Path(folder)
+    if not is_image_folder(path):
+        return path
+    return _rename_folder_to_standard(path)
 
 
 def standardize_comic(
@@ -230,9 +249,14 @@ def standardize_comic(
         return src
 
     if is_image_folder(src):
+        actions = []
+        if needs_png_conversion(src):
+            actions.append("PNG pages")
+        if needs_folder_rename(src):
+            actions.append("folder rename")
         print(
             f"Standardizing folder: {src.name} "
-            f"({len(list_folder_images(src))} pages)"
+            f"({len(list_folder_images(src))} pages; {', '.join(actions)})"
         )
         return _standardize_image_folder(src)
 
