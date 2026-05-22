@@ -8,6 +8,14 @@ import sys
 from pathlib import Path
 from typing import Iterable, List, Optional, Set
 
+from manga_keeper.artist import (
+    build_artist_profiles,
+    collect_comic_signatures,
+    extract_artist_tag,
+    is_untagged_comic,
+    proposed_tagged_name,
+    suggest_artists_for_untagged,
+)
 from manga_keeper.index import ComicIndex, index_file_for
 from manga_keeper.scanner import scan_directory
 from manga_keeper.hasher import find_exact_duplicates, select_file_to_keep
@@ -178,6 +186,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--rebuild-cache",
         action="store_true",
         help="Ignore and rebuild the local scan/hash index.",
+    )
+    parser.add_argument(
+        "--suggest-artists",
+        action="store_true",
+        help="Suggest artist tags for untagged comics using tagged library styles.",
+    )
+    parser.add_argument(
+        "--artists-only",
+        action="store_true",
+        help="Scan the library and run artist suggestions only.",
+    )
+    parser.add_argument(
+        "--artist-min-samples",
+        type=int,
+        default=3,
+        help="Minimum tagged comics required to learn an artist profile. Default: 3.",
+    )
+    parser.add_argument(
+        "--artist-threshold",
+        type=int,
+        default=12,
+        help="Visual similarity threshold for artist suggestions. Default: 12.",
+    )
+    parser.add_argument(
+        "--apply-artist-tags",
+        action="store_true",
+        help="Prompt to rename untagged comics when an artist match is suggested.",
     )
     return parser
 
@@ -458,6 +493,122 @@ def _phase_conversion(
     return changed, bytes_delta
 
 
+def _unique_folder_path(parent: Path, folder_name: str) -> Path:
+    candidate = parent / folder_name
+    counter = 2
+    while candidate.exists():
+        candidate = parent / f"{folder_name}__{counter}"
+        counter += 1
+    return candidate
+
+
+def _phase_artist_suggestions(
+    files: List[Path],
+    dry_run: bool,
+    log: logging.Logger,
+    comic_index: Optional[ComicIndex] = None,
+    *,
+    use_cache: bool = True,
+    min_samples: int = 3,
+    threshold: int = 12,
+    apply_tags: bool = False,
+) -> int:
+    _header("Phase 5: Suggesting Artist Tags")
+
+    tagged = [path for path in files if extract_artist_tag(path.name)]
+    untagged = [path for path in files if is_untagged_comic(path)]
+    print(
+        f"Tagged comics: {len(tagged)} | Untagged comics: {len(untagged)} | "
+        f"Learning from artists with at least {min_samples} tagged work(s)."
+    )
+
+    if len(tagged) < min_samples:
+        _warn("Not enough tagged comics to learn artist styles.")
+        return 0
+
+    try:
+        signatures = collect_comic_signatures(
+            files,
+            comic_index,
+            use_cache=use_cache,
+        )
+    except Exception as exc:
+        log.error("Artist signature collection failed: %s", exc)
+        _err(f"Artist signature collection failed: {exc}")
+        return 0
+
+    profiles = build_artist_profiles(signatures, min_samples=min_samples)
+    if not profiles:
+        _warn("No artist profiles met the minimum sample count.")
+        return 0
+
+    print(_color(f"Learned {len(profiles)} artist profile(s).", "bold"))
+    suggestions = suggest_artists_for_untagged(
+        untagged,
+        signatures,
+        profiles,
+        threshold=threshold,
+    )
+
+    if not suggestions:
+        _ok("No confident artist matches found for untagged comics.")
+        return 0
+
+    applied = 0
+    for path, suggestion in suggestions:
+        proposed = proposed_tagged_name(path.name, suggestion.artist)
+        print()
+        print(_color("Untagged comic:", "bold"))
+        print(f"  {path.name}")
+        print(
+            f"  {_color('SUGGEST', 'magenta')} [{suggestion.artist}] "
+            f"(confidence: {suggestion.confidence}, "
+            f"distance: {suggestion.avg_distance:.1f}, "
+            f"from {suggestion.sample_count} tagged work(s), "
+            f"margin: {suggestion.margin:.1f})"
+        )
+        print(f"  proposed: {proposed}")
+
+        if dry_run:
+            _warn("  Dry run: would suggest this artist tag.")
+            continue
+
+        if not apply_tags:
+            continue
+
+        if not _confirm(
+            _color(f"  Rename to [{suggestion.artist}] ...? [Y/n]", "yellow")
+        ):
+            _warn("  Skipped.")
+            continue
+
+        destination = _unique_folder_path(path.parent, proposed)
+        try:
+            path.rename(destination)
+        except OSError as exc:
+            log.error("Failed renaming %s -> %s: %s", path, destination, exc)
+            _err(f"  Failed to rename {path.name}")
+            continue
+
+        applied += 1
+        if comic_index is not None:
+            comic_index.remove(path)
+            comic_index.ensure_metadata(destination)
+        _ok(f"  Renamed -> {destination.name}")
+
+    if dry_run:
+        _warn("Dry run: no folders were renamed.")
+    elif apply_tags:
+        _ok(f"Applied {applied} artist tag(s).")
+    else:
+        _ok(
+            f"Found {len(suggestions)} artist suggestion(s). "
+            "Re-run with --apply-artist-tags to rename matched folders."
+        )
+
+    return len(suggestions)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -491,6 +642,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"  dry-run:   {args.dry_run}")
     print(f"  keep-originals: {args.keep_originals}")
     print(f"  cache:     {'rebuild' if not use_cache else f'{len(index)} record(s)'}")
+    if args.suggest_artists or args.artists_only:
+        print(f"  artists:   min-samples={args.artist_min_samples}, threshold={args.artist_threshold}")
 
     _header("Phase 1: Scanning Directory")
     try:
@@ -511,25 +664,39 @@ def main(argv: Optional[List[str]] = None) -> int:
     exact_removed = perceptual_removed = 0
     exact_bytes = perceptual_bytes = 0
     converted = converted_bytes_delta = 0
+    artist_suggestions = 0
 
     try:
-        files, exact_removed, exact_bytes = _phase_exact_duplicates(
-            files, trash_dir, args.dry_run, log, index, use_cache=use_cache
-        )
+        if not args.artists_only:
+            files, exact_removed, exact_bytes = _phase_exact_duplicates(
+                files, trash_dir, args.dry_run, log, index, use_cache=use_cache
+            )
 
-        files, perceptual_removed, perceptual_bytes = _phase_perceptual_duplicates(
-            files,
-            args.threshold,
-            trash_dir,
-            args.dry_run,
-            log,
-            index,
-            use_cache=use_cache,
-        )
+            files, perceptual_removed, perceptual_bytes = _phase_perceptual_duplicates(
+                files,
+                args.threshold,
+                trash_dir,
+                args.dry_run,
+                log,
+                index,
+                use_cache=use_cache,
+            )
 
-        converted, converted_bytes_delta = _phase_conversion(
-            files, trash_dir, args.dry_run, args.keep_originals, log, comic_index=index
-        )
+            converted, converted_bytes_delta = _phase_conversion(
+                files, trash_dir, args.dry_run, args.keep_originals, log, comic_index=index
+            )
+
+        if args.suggest_artists or args.artists_only:
+            artist_suggestions = _phase_artist_suggestions(
+                files,
+                args.dry_run,
+                log,
+                index,
+                use_cache=use_cache,
+                min_samples=args.artist_min_samples,
+                threshold=args.artist_threshold,
+                apply_tags=args.apply_artist_tags,
+            )
     except KeyboardInterrupt:
         print()
         _warn("Interrupted by user. Saving index before exit.")
@@ -554,6 +721,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"  Comics standardized:      {converted} "
         f"(net {format_size(converted_bytes_delta)})"
     )
+    if args.suggest_artists or args.artists_only:
+        print(f"  Artist suggestions:       {artist_suggestions}")
     print(
         _color(f"  Approx. space saved:      {format_size(total_reclaimed)}", "green", "bold")
     )

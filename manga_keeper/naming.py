@@ -13,14 +13,35 @@ TRAILING_COPY_NUMBER = re.compile(r"\(\s*\d+\s*\)\s*$")
 STANDALONE_COPY = re.compile(r"(?:^|\s)copy(?:\s|$)", re.IGNORECASE)
 STANDALONE_DUPLICATE = re.compile(r"(?:^|\s)duplicate(?:\s|$)", re.IGNORECASE)
 
-_BRACKET_OPEN = "([（［【"
-_BRACKET_CLOSE = ")]）］】"
+# Map fullwidth and CJK bracket variants to ASCII square brackets / parentheses.
+_BRACKET_CHAR_MAP = str.maketrans(
+    {
+        "【": "[",
+        "】": "]",
+        "［": "[",
+        "］": "]",
+        "「": "[",
+        "」": "]",
+        "『": "[",
+        "』": "]",
+        "（": "(",
+        "）": ")",
+    }
+)
+
+_BRACKET_OPEN = "(["
+_BRACKET_CLOSE = ")]"
 _BRACKET_OPEN_RE = re.compile(
     rf"(?<=[^{re.escape(_BRACKET_OPEN)}\s])([{re.escape(_BRACKET_OPEN)}])"
 )
 _BRACKET_CLOSE_RE = re.compile(
     rf"([{re.escape(_BRACKET_CLOSE)}])(?=[^{re.escape(_BRACKET_CLOSE + _BRACKET_OPEN)}\s])"
 )
+
+
+def _normalize_bracket_characters(name: str) -> str:
+    """Convert bracket variants to ASCII [] and ()."""
+    return name.translate(_BRACKET_CHAR_MAP)
 
 
 def _normalize_bracket_spacing(name: str) -> str:
@@ -44,6 +65,7 @@ def standardize_folder_name(name: str) -> str:
     cleaned = INVALID_FILENAME_CHARS.sub("", name.strip())
     cleaned = TRAILING_COPY_NUMBER.sub("", cleaned).strip()
     cleaned = _remove_noise_tokens(cleaned)
+    cleaned = _normalize_bracket_characters(cleaned)
     cleaned = _normalize_bracket_spacing(cleaned)
     cleaned = _collapse_spaces(cleaned)
     return cleaned or name.strip()

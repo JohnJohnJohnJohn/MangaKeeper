@@ -53,7 +53,24 @@ MangaKeeper processes your collection in four phases:
 
 3. **Perceptual Dedup** — Samples pages from each archive and computes perceptual hashes. Files with similar page signatures (below the threshold) are grouped as duplicates of the same title. The highest-quality version is kept.
 
-4. **Standardize** — Converts page images to lossless PNG (original filenames preserved) and renames comic folders to a cleaned standard convention: no double spaces, spaces around `[]` / `()` / `【】` / fullwidth brackets, duplicate markers removed. Archives are extracted into a standardized folder.
+4. **Standardize** — Converts page images to lossless PNG (original filenames preserved) and renames comic folders to a cleaned standard convention: bracket variants normalized to ASCII `[]` / `()`, no double spaces, spaces around bracket groups, duplicate markers removed. Archives are extracted into a standardized folder.
+
+5. **Suggest artists** *(optional)* — Learns visual style profiles from tagged folders like `[Artist A] Title` and suggests likely artists for untagged comics based on page similarity.
+
+## Artist suggestions
+
+If many folders follow a tag pattern such as `[artist_a] manga_b`, MangaKeeper can compare untagged comics against learned artist style profiles built from your tagged library.
+
+```bash
+python3 -m manga_keeper.cli --path /path/to/manga --artists-only
+python3 -m manga_keeper.cli --path /path/to/manga --suggest-artists --apply-artist-tags
+```
+
+Requirements and caveats:
+
+- An artist needs at least `--artist-min-samples` tagged works (default: 3) before MangaKeeper will suggest them
+- Suggestions are visual-style matches, not proof — scan groups, magazines, AI prompts, and collaborators can create false positives
+- Use suggestions as a starting point; review before applying tags with `--apply-artist-tags`
 
 ## Index cache
 
@@ -81,6 +98,11 @@ Unchanged comics skip re-listing their page files during scan and skip re-hashin
 | `--threshold` | Perceptual hash distance threshold for duplicate detection | `10` |
 | `--log-file` | Path to write a detailed operation log | None |
 | `--rebuild-cache` | Ignore and rebuild the local scan/hash index | `False` |
+| `--suggest-artists` | Suggest artist tags for untagged comics after the normal pipeline | `False` |
+| `--artists-only` | Scan and run artist suggestions only | `False` |
+| `--artist-min-samples` | Minimum tagged works required to learn an artist profile | `3` |
+| `--artist-threshold` | Visual similarity threshold for artist suggestions | `12` |
+| `--apply-artist-tags` | Prompt to rename untagged folders when a match is suggested | `False` |
 
 ## License
 
