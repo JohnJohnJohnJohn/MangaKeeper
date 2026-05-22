@@ -198,6 +198,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Scan the library and run artist suggestions only.",
     )
     parser.add_argument(
+        "--standardize-only",
+        action="store_true",
+        help="Scan the library and run folder/PNG standardization (phase 4) only.",
+    )
+    parser.add_argument(
         "--artist-min-samples",
         type=int,
         default=3,
@@ -621,6 +626,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception:
             pass
 
+    if args.artists_only and args.standardize_only:
+        _err("Choose only one of --artists-only or --standardize-only.")
+        return 2
+
     root = Path(args.path).expanduser().resolve()
     if not root.exists():
         _err(f"Path does not exist: {root}")
@@ -667,7 +676,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     artist_suggestions = 0
 
     try:
-        if not args.artists_only:
+        if args.standardize_only:
+            converted, converted_bytes_delta = _phase_conversion(
+                files, trash_dir, args.dry_run, args.keep_originals, log, comic_index=index
+            )
+        elif not args.artists_only:
             files, exact_removed, exact_bytes = _phase_exact_duplicates(
                 files, trash_dir, args.dry_run, log, index, use_cache=use_cache
             )

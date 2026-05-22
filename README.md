@@ -100,6 +100,7 @@ Unchanged comics skip re-listing their page files during scan and skip re-hashin
 | `--rebuild-cache` | Ignore and rebuild the local scan/hash index | `False` |
 | `--suggest-artists` | Suggest artist tags for untagged comics after the normal pipeline | `False` |
 | `--artists-only` | Scan and run artist suggestions only | `False` |
+| `--standardize-only` | Scan and run folder/PNG standardization (phase 4) only | `False` |
 | `--artist-min-samples` | Minimum tagged works required to learn an artist profile | `3` |
 | `--artist-threshold` | Visual similarity threshold for artist suggestions | `12` |
 | `--apply-artist-tags` | Prompt to rename untagged folders when a match is suggested | `False` |
